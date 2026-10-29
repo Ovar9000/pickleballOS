@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS positions (
   court_x REAL, court_y REAL, conf REAL, estimated INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (session_id, ts, slot)
 );
+CREATE TABLE IF NOT EXISTS rallies (
+  id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, game_id INTEGER, rally_no INTEGER,
+  start_ts REAL, end_ts REAL, hits INTEGER, bounces INTEGER, server_slot TEXT,
+  winner_team TEXT CHECK (winner_team IN ('A','B')),
+  outcome_source TEXT CHECK (outcome_source IN ('scorer','auto')), end_reason TEXT
+);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, rally_id INTEGER,
   ts REAL NOT NULL, frame INTEGER, type TEXT NOT NULL, slot TEXT,
@@ -68,6 +74,13 @@ class EventLog:
             "INSERT INTO events (session_id, ts, frame, type, slot, court_x, court_y, img_u, img_v, conf, source, extra)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (session_id, ts, frame, type, slot, x, y, u, v, conf, source, json.dumps(extra) if extra else None))
+        return int(cur.lastrowid)
+
+    def add_rally(self, session_id: str, start: float, end: float, hits: int, bounces: int) -> int:
+        n = self.conn.execute("SELECT COUNT(*) FROM rallies WHERE session_id=?", (session_id,)).fetchone()[0]
+        cur = self.conn.execute(
+            "INSERT INTO rallies (session_id, rally_no, start_ts, end_ts, hits, bounces) VALUES (?,?,?,?,?,?)",
+            (session_id, n + 1, start, end, hits, bounces))
         return int(cur.lastrowid)
 
     def commit(self) -> None:

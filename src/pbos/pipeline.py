@@ -17,12 +17,14 @@ import cv2
 import numpy as np
 
 from . import court
+from .audio import OnsetDetector, load_audio
 from .ball import BallDetector, BallTracker, detect_and_track, detection_roi
 from .calibration import Calibration
 from .camera3d import Camera3D, CameraModelError
 from .camera_motion import CameraMotionMonitor
 from .eventlog import EventLog
-from .players import PersonDetection, PlayerDetector
+from .fusion import ContactFusion, PlayerSnapshot, RallyTracker
+from .players import LEFT_WRIST, RIGHT_WRIST, PersonDetection, PlayerDetector
 from .render import render_frame
 from .tracking import CourtTracker, DistanceMeter, Measurement
 
@@ -84,7 +86,7 @@ def measure(dets: list[PersonDetection], calib: Calibration, cfg: TrackConfig) -
         if not court.in_court(*xy, side_margin=cfg.side_margin_ft, end_margin=cfg.end_margin_ft):
             continue
         sigma_px = cfg.box_sigma_px if cue == "box" else cfg.ankle_sigma_px
-        out.append(Measurement(xy, max(0.15, sigma_px * calib.ft_per_px(uv)), d.box, cue))
+        out.append(Measurement(xy, max(0.15, sigma_px * calib.ft_per_px(uv)), d.box, cue, d.keypoints, d.kp_scores))
         cues[cue] += 1
     return out, cues
 
@@ -157,6 +159,14 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
     ball_seen = -1e9
     bounces: list[tuple[float, np.ndarray]] = []
     ball_stats: Counter = Counter()
+    try:
+        onsets = OnsetDetector().detect(load_audio(video, start, end), start)
+    except Exception:  # no audio track or no ffmpeg: contacts then come from vision alone
+        onsets = []
+    next_onset = 0
+    fusion = ContactFusion(require_audio=bool(onsets))
+    rallies = RallyTracker()
+    contact_stats: Counter = Counter()
 
     frames = range(n_frames)
     if progress:
@@ -229,19 +239,43 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
             ball_stats["frames_tracked"] += 1  # detected, or coasting on a fitted arc
         if bs.xyz is not None:
             ball_stats["frames_3d"] += 1
-        for e in bs.events:
-            ball_stats[e.kind] += 1
-            hitter = None
-            if e.kind == "hit" and e.court_xy is not None and players:
-                slot, p = min(players.items(), key=lambda kv: np.linalg.norm(kv[1].xy - e.court_xy))
-                hitter = slot if np.linalg.norm(p.xy - e.court_xy) < 8.0 else None
-            if e.kind == "bounce":
-                bounces = [b for b in bounces if t - b[0] < 3.0] + [(e.t, e.court_xy)]
+        for e in bs.events:  # raw direction changes, kept for evaluation; fusion decides what they were
+            ball_stats["direction_changes"] += 1
             if log:
-                log.add_event(sid, e.t, "bounce" if e.kind == "bounce" else "contact", slot=hitter,
-                              court_xy=e.court_xy, img_uv=e.uv, source="vision",
-                              extra={"speed_mph_est": e.speed_mph})
+                log.add_event(sid, e.t, "ball_break", court_xy=e.court_xy, img_uv=e.uv, source="vision",
+                              extra={"vision_kind": e.kind, "speed_mph_est": e.speed_mph})
         timings["ball"] += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        while next_onset < len(onsets) and onsets[next_onset].t <= t:
+            fusion.add_onsets([onsets[next_onset]])
+            next_onset += 1
+        snaps = {}
+        for slot, tr in players.items():
+            if tr.box is None:
+                continue
+            wrists = np.zeros((0, 2))
+            if tr.keypoints is not None and tr.kp_scores is not None:
+                ok_w = [k for k in (LEFT_WRIST, RIGHT_WRIST) if tr.kp_scores[k] >= cfg.kp_thr]
+                wrists = tr.keypoints[ok_w]
+            snaps[slot] = PlayerSnapshot(tr.box, wrists, tr.xy.copy())
+        fusion.add_frame(t, bs.uv if bs.uv is not None else bs.predicted_uv, snaps, in_flight=bs.xyz is not None)
+        fusion.add_vision(bs.events)
+        for c in fusion.resolve(t):
+            contact_stats[f"{c.kind}_{c.source}"] += 1
+            closed = rallies.on_contact(c)
+            if closed and log:
+                log.add_rally(sid, closed.start, closed.end, closed.hits, closed.bounces)
+            if c.kind == "bounce" and c.court_xy is not None:
+                bounces = [b for b in bounces if t - b[0] < 3.0] + [(c.t, c.court_xy)]
+            if log:
+                log.add_event(sid, c.t, "contact" if c.kind == "hit" else "bounce", slot=c.slot,
+                              court_xy=c.court_xy, img_uv=c.uv, source=c.source,
+                              extra={"speed_mph_est": c.speed_mph})
+        closed = rallies.step(t)
+        if closed and log:
+            log.add_rally(sid, closed.start, closed.end, closed.hits, closed.bounces)
+        timings["fusion"] += time.perf_counter() - t0
 
         if sink:
             t0 = time.perf_counter()
@@ -254,8 +288,14 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
                 "mph": bs.last_mph,
                 "bounces": [(xy, 1 - (t - tb) / 3.0) for tb, xy in bounces if 0 <= t - tb < 3.0],
             }
+            if rallies.current is not None:
+                rally_view = {"hits": rallies.current.hits, "live": True}
+            elif rallies.rallies:
+                rally_view = {"hits": rallies.rallies[-1].hits, "live": False}
+            else:
+                rally_view = None
             view = render_frame(frame, active_calib, {s: {"xy": tr.xy, "box": tr.box} for s, tr in players.items()},
-                                {s: m.total_ft for s, m in meters.items()}, cam_status, ball_view)
+                                {s: m.total_ft for s, m in meters.items()}, cam_status, ball_view, rally_view)
             timings["render"] += time.perf_counter() - t0
             t0 = time.perf_counter()
             sink.write(view)
@@ -284,6 +324,9 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
                  "fitted_3d_share": round(ball_stats["frames_3d"] / max(done, 1), 3),
                  "camera_focal_px": round(camera3d.focal_px, 1) if camera3d else None,
                  "camera_position_ft": [round(v, 1) for v in camera3d.center] if camera3d else None},
+        "contacts": {**dict(contact_stats), "audio_onsets": len(onsets)},
+        "rallies": [{"start": round(r.start, 2), "end": round(r.end, 2), "hits": r.hits, "bounces": r.bounces}
+                    for r in rallies.rallies + ([rallies.current] if rallies.current else [])],
         "camera_events": camera_events,
         "ms_per_frame": per_frame_ms,
         "analysis_fps": round(1000 / analysis_ms, 1) if analysis_ms else None,

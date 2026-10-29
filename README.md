@@ -107,8 +107,24 @@ relaxed second detection near the prediction for motion-blurred frames. On a 10 
 the track from 20 fragments to one continuous track (detections 228 → 252 of 299 frames). Over the
 whole 80 s sample, ball detection went from 53% to 65% of frames, and 76% of frames are tracked
 (the rest is mostly dead time and the cut-away).
-Known limitation: after a rally ends, a rolling or carried ball still produces some "hit" events.
-Audio paddle-pop fusion and rally segmentation (next) are meant to remove them.
+## Phase 4 (part 2) — audio contacts, fusion, rallies
+
+Also inside `pbos track`. The soundtrack is scanned for paddle pops: sharp 1.5–6 kHz bursts at
+least 12 dB above the past second's background. Pops are fused with the ball track's direction
+changes and the players' wrists from pose:
+
+- **hit**: a pop plus a direction change at a wrist, or a pop while a ball in flight reaches a wrist
+  (the contact itself hidden from the camera). Credited to that player.
+- **bounce**: a low, falling direction change away from the players; placed exactly on the court.
+- dropped: pops from other courts, a dead ball rolling or being caught.
+
+Hits group into rallies (gaps under 3 s). The overlay gets a **RALLY TOTAL · OBSERVED CONTACTS**
+card, and the log gets `contact` / `bounce` events (with their source: `audio+vision` or `audio`),
+raw `ball_break` events for evaluation, and a `rallies` table.
+
+On the sample (420–500 s): 241 audio onsets → 60 hits and 10 bounces in 5 rallies. Without fusion,
+vision alone had logged 85 "hits". One 17 s dink rally was checked frame by frame and is real. Exact
+hit precision and recall still need labelled events.
 
 ## Compute tiers
 
@@ -136,6 +152,7 @@ took 6 ms on the GPU). Pose runs as one batched call with float32 preprocessing.
 | 1 | DESIGN.md | done (v0.2, decisions folded in) |
 | 2 | Calibration tool + leave-one-out accuracy | done |
 | 3 | Player tracking → positions → distance, court map, camera-move check | done |
-| 4 | Ball tracking, 3D arcs, bounces, speed | done · audio contacts next |
+| 4 | Ball tracking, 3D arcs, bounces, speed, audio contacts, rallies | done (classical ball detector) |
+| next | Learned ball detector (TrackNet-style), trained on auto-labelled sample footage | proposed |
 
 License: [MIT](LICENSE).

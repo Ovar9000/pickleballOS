@@ -82,6 +82,15 @@ def draw_speed_card(img: np.ndarray, mph: float | None, x: int, y: int) -> None:
     _text(img, "AVG HORIZONTAL - EST.", (x + 16, y + 84), 0.36, MUTED)
 
 
+def draw_rally_card(img: np.ndarray, rally: dict | None, x: int, y: int) -> None:
+    w, h = 250, 92
+    _panel(img, x, y, w, h)
+    live = bool(rally and rally.get("live"))
+    _text(img, "RALLY TOTAL" if live or not rally else "LAST RALLY", (x + 16, y + 26), 0.55, TEXT, 1)
+    _text(img, str(rally["hits"]) if rally else "--", (x + 16, y + 66), 1.2, TEXT, 2)
+    _text(img, "OBSERVED CONTACTS", (x + 16, y + 84), 0.36, MUTED)
+
+
 def draw_court_map(img: np.ndarray, players: dict[str, np.ndarray], x: int, y: int, px_per_ft: float = 4.0,
                    ball_xy=None, bounces=()) -> None:
     cw, ch = int(court.WIDTH_FT * px_per_ft), int(court.LENGTH_FT * px_per_ft)
@@ -131,7 +140,8 @@ def draw_distance_panel(img: np.ndarray, distances: dict[str, float], x: int, y:
 
 
 def render_frame(frame: np.ndarray, calib: Calibration, players: dict[str, dict], distances: dict[str, float],
-                 camera_status: str = "steady", ball: dict | None = None) -> np.ndarray:
+                 camera_status: str = "steady", ball: dict | None = None,
+                 rally: dict | None = None) -> np.ndarray:
     """players: slot -> {"xy": court ft, "box": px box or None}.
     ball: {"uv", "trail", "xy" (estimated ground track or None), "mph", "bounces": [(xy, alpha)]}."""
     img = frame.copy()
@@ -145,6 +155,7 @@ def render_frame(frame: np.ndarray, calib: Calibration, players: dict[str, dict]
     if ball:
         draw_ball(img, ball.get("uv"), ball.get("trail", []), ball.get("predicted_uv"))
     draw_speed_card(img, ball.get("mph"), W - 16 - 250, 170)
+    draw_rally_card(img, rally, W - 16 - 250, 272)
     draw_distance_panel(img, distances, 16, H - 160)
     draw_court_map(img, {s: p["xy"] for s, p in players.items()}, W - 16 - 108, H - 16 - 234,
                    ball_xy=ball.get("xy"), bounces=ball.get("bounces", ()))

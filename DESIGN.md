@@ -246,6 +246,7 @@ them to an identity or to any other session.
 | Contacts | **Fused**: audio onset ∧ (ball direction change ∨ wrist–ball proximity) within ±2 frames | Audio only (adjacent courts pop too); vision only (misses occluded contacts) | Adjacent-court pops are rejected by requiring vision support; occluded contacts are kept when audio + wrist agree. |
 | Bounces | End of a fitted flight that finishes low and falling; the touchdown pixel is mapped through H | Image-velocity reversal only; learned bounce classifier | The ground point maps exactly through H, so 2D is enough for bounce position. |
 | Ball in the air (court-map position, speed) | **Single-view 3D**: recover the full camera (focal length + pose) from the court homography (Zhang's plane calibration, principal point at centre), then fit each flight between velocity changes with a ballistic arc under known gravity (linear least squares, 6 unknowns) | Mapping the ball pixel through H (wrong: it is not on the ground); a second synced camera | Gravity fixes the depth ambiguity: how fast the ball falls in the image depends on its distance. Validated by projecting the 34–36 in net tape, which was never used in the fit, onto the real tape. Drag is ignored, so speed and height are labelled estimates; a second camera remains the upgrade path for net clearance. |
+| Contacts and rallies | **Fusion** of three cues: audio pops (band-passed log energy rising ≥ 12 dB above the past second's median, ms-accurate), ball-track direction changes, and pose wrists. A hit needs a pop *and* either a direction change at a wrist, or a ball in flight arriving at a wrist (contact hidden from the camera). A bounce is a low, falling direction change away from wrists. Rallies are runs of hits with gaps < 3 s | Vision-only contacts; audio-only contacts | Each cue alone failed on the sample: vision logged 85 "hits" in 80 s, many of them a rolling or carried dead ball, and couldn't tell a dink hit from a bounce (both low and falling). Audio found 241 onsets in 80 s, including neighbouring courts. Requiring a pop for every hit and a ball in flight for audio-only hits cut the result to 60 hits in 5 rallies, consistent with the footage (one 17 s dink rally checked frame by frame). Exact precision and recall need the labelled events in §11. |
 | GPU | **Optional accelerator**, through ONNX Runtime execution providers (CUDA on NVIDIA, DirectML on any Windows GPU, OpenVINO on Intel); CPU stays the reference path | GPU-only pipeline | CUDA is proprietary, but it is only a runtime we call; our code stays MIT and nothing NVIDIA is bundled. The CPU path keeps the system reproducible on any machine, and each provider is just another compute tier to measure (§9). |
 | Rally outcome | **Scorer UI** on a phone (tap "point" / "side out" — the score sequence implies the rally winner) | Automatic inference from last bounce / net | Ground truth for training must be correct; auto-inference becomes a later accuracy experiment. |
 | Calibration | **≥4 named keypoints**, least-squares homography, per-point residual report | 4 corners only; learned court-line detector | Works when baselines are off-frame; zero training data; residuals catch bad clicks. |
@@ -393,7 +394,8 @@ YOLOX-tiny + RTMPose-s every 2nd frame, classical ball every frame, ms per frame
 | CPU, 4 threads | 16.4 | 15.4 | 6.5 | 23.4 | no |
 | CPU, 2 threads | 21.9 | 20.2 | 7.2 | 18.6 | no |
 
-CPU tiers reach real time by running the detector every 3rd frame (the tracker fills the gaps).
+GPU numbers need an otherwise idle GPU: a later run with another application holding the GPU at
+88% load measured 18 fps. CPU tiers reach real time by running the detector every 3rd frame (the tracker fills the gaps).
 Further GPU headroom is available (FP16, TensorRT, batching detection and pose), but it isn't needed
 for 30 fps. If a device is bought
 later, Option B (x86 + OpenVINO) is the lower-risk port, since the same code runs unchanged; Option A
@@ -566,7 +568,7 @@ rating/gamification layer as extensions.
 | 1 | DESIGN.md | this document |
 | 2 | Calibration tool (`pbos calibrate`), top-down verification, leave-one-out error | implemented |
 | 3 | Offline player tracking (detector + RTMPose + court-space tracker) → court positions → distance + court-map overlay video; camera-move check | implemented |
-| 4 | Ball tracking, bounces, audio contacts, fusion | ball detection, single-view 3D arcs, bounces, speed: implemented · audio contacts + fusion: next |
+| 4 | Ball tracking, bounces, audio contacts, fusion | implemented (classical ball detector; learned TrackNet-style model is the next upgrade) |
 | 5 | Event log + stats with synthetic-event unit tests | |
 | 6 | HUD renderer (offline MP4 + web) in the reference style | |
 | 7 | Labelling tool + evaluation scripts (layers 1–3, events, stats) | |

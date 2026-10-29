@@ -27,6 +27,8 @@ class Measurement:
     sigma_ft: float  # measurement noise; grows with distance from the camera
     box: np.ndarray | None = None
     cue: str = "box"
+    keypoints: np.ndarray | None = None  # (17, 2) pixels, COCO order
+    kp_scores: np.ndarray | None = None
 
 
 @dataclass
@@ -40,6 +42,8 @@ class Track:
     confirmed: bool = False
     slot: str | None = None
     box: np.ndarray | None = None
+    keypoints: np.ndarray | None = None
+    kp_scores: np.ndarray | None = None
 
     @property
     def xy(self) -> np.ndarray:
@@ -122,6 +126,7 @@ class CourtTracker:
                 tr, m = group[r], ms[remaining[c]]
                 self._update(tr, m)
                 tr.last_update, tr.hits, tr.box = t, tr.hits + 1, m.box
+                tr.keypoints, tr.kp_scores = m.keypoints, m.kp_scores
                 used.add(remaining[c])
             remaining = [j for j in remaining if j not in used]
         return [ms[j] for j in remaining]
