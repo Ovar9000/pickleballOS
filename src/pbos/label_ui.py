@@ -1,5 +1,9 @@
 """Ball ground-truth labelling: review random frames, click the ball or mark it not visible.
 
+What counts as visible: you can see at least part of the ball (a blurred streak counts). Press n when
+it is hidden behind a player or the paddle, held in a hand or pocket between points, or out of frame.
+Never click where you think the ball is: a guessed position teaches a detector to fire on shirts.
+
 Keys: left-click = ball here (saves, next frame) · Enter/Space = accept the suggestion ring ·
 n = ball not visible · s = skip · b = back · q/Esc = save and quit. A loupe magnifies the area
 under the cursor. Progress is saved after every frame, so a session can be resumed any time.
@@ -47,13 +51,17 @@ def _loupe(img, x, y, size=180, zoom=4):
     return big
 
 
-def run(video: str, out: str, frames: list[int], fps: float, make_detector=None) -> int:
-    """Label the given frames (in order). Returns how many labels the file holds afterwards."""
+def run(video: str, out: str, frames: list[int], fps: float, make_detector=None, review: bool = False) -> int:
+    """Label the given frames (in order). Returns how many labels the file holds afterwards.
+
+    review=True walks frames that already have a label, showing that label as the ring (red when it
+    says "not visible"), so earlier answers can be confirmed (Enter) or corrected.
+    """
     done: dict[int, BallLabel] = {}
     if Path(out).exists():
         _, prev = load_labels(out)
         done = {lb.frame: lb for lb in prev}
-    todo = [f for f in frames if f not in done]
+    todo = [f for f in frames if (f in done) == review]
     cap = cv2.VideoCapture(video)
     state = {"mouse": None, "click": None}
 
@@ -72,15 +80,20 @@ def run(video: str, out: str, frames: list[int], fps: float, make_detector=None)
             if img is None:
                 i += 1
                 continue
-            sug = _suggest(cap, f, make_detector)
+            prev = done.get(f) if review else None
+            sug = np.array([prev.u, prev.v]) if prev is not None and prev.visible else (
+                None if review else _suggest(cap, f, make_detector))
             state["click"] = None
             decided = None
             while decided is None:
                 view = img.copy()
                 if sug is not None:
                     cv2.circle(view, tuple(np.round(sug).astype(int)), 12, (0, 255, 255), 1, cv2.LINE_AA)
-                bar = (f"frame {f} ({f / fps:.2f}s)  {len(done)} labelled, {len(todo) - i} to go  |  "
-                       "click=ball  Enter=accept ring  n=not visible  s=skip  b=back  q=quit")
+                if prev is not None and not prev.visible:
+                    cv2.putText(view, "labelled: NOT VISIBLE (Enter keeps it)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, (0, 0, 255), 2, cv2.LINE_AA)
+                bar = (f"frame {f} ({f / fps:.2f}s)  {len(done)} labelled, {len(todo) - i} to go  |  click=ball  "
+                       "Enter=accept  n=hidden/held/out of frame  s=skip  b=back  q=quit")
                 cv2.rectangle(view, (0, 0), (view.shape[1], 28), (20, 20, 20), -1)
                 cv2.putText(view, bar, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
                 if state["mouse"]:
@@ -94,12 +107,16 @@ def run(video: str, out: str, frames: list[int], fps: float, make_detector=None)
                     decided = BallLabel(f, *state["click"], True, "human")
                 elif key in (13, 32) and sug is not None:
                     decided = BallLabel(f, float(sug[0]), float(sug[1]), True, "human")
+                elif key in (13, 32) and prev is not None:
+                    decided = prev  # review: keep the earlier answer
                 elif key == ord("n"):
                     decided = BallLabel(f, -1.0, -1.0, False, "human")
                 elif key == ord("s"):
                     decided = "skip"
                 elif key == ord("b") and history:
-                    done.pop(history.pop(), None)
+                    back_to = history.pop()
+                    if not review:  # in review the earlier answer stays until it is replaced
+                        done.pop(back_to, None)
                     i -= 2
                     decided = "back"
                 elif key in (ord("q"), 27):

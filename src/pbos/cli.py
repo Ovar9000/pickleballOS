@@ -173,6 +173,8 @@ def cmd_ball_train(args) -> int:
     gap = 2.0  # seconds kept out on both sides of the validation window: neighbouring frames look alike
     val = [lb for lb in labels if v0 <= lb.frame / fps < v1][:: args.stride]
     train = [lb for lb in labels if not (v0 - gap <= lb.frame / fps < v1 + gap)][:: args.stride]
+    # Hand labels are few next to thousands of auto labels; repeat them so they actually shape the model.
+    train += [lb for lb in train if lb.source == "human"] * (args.human_weight - 1)
     n_neg = sum(not lb.visible for lb in train)
     print(f"{n_auto} auto + {len(human)} human labels -> train {len(train)} ({n_neg} negatives), "
           f"val {len(val)} (every {args.stride}th)")
@@ -185,6 +187,10 @@ def cmd_ball_train(args) -> int:
                    "val_window_s": [v0, v1]})
     Path(args.out, "train_report.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({k: report[k] for k in ("best_val_hit_rate", "train_labels", "val_labels", "device")}))
+    if report.get("export_error"):
+        print(f"saved {Path(args.out, 'ballnet.pt')} only: ONNX export failed (see the command above, or "
+              f"`pip install onnx` in this environment and retrain)")
+        return 1
     print(f"saved {Path(args.out, 'ballnet.onnx')}")
     return 0
 
@@ -196,7 +202,11 @@ def cmd_label(args) -> int:
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
     ranges = _parse_ranges(args.range)
-    if args.mode == "hard":
+    if args.review:
+        from .balldata import load_labels
+
+        frames = [lb.frame for lb in load_labels(args.out)[1]]
+    elif args.mode == "hard":
         from .balldata import hard_frames, load_labels
 
         auto_path = args.auto_labels or f"out/ball_dataset/{Path(args.video).stem}_auto.json"
@@ -209,7 +219,7 @@ def cmd_label(args) -> int:
     if args.calib:
         kind = "learned" if args.ball_model else "classical"
         make = _ball_detector_factory(kind, Calibration.load(args.calib), args.ball_model, args.device)
-    n = label_ui.run(args.video, args.out, frames, fps, make)
+    n = label_ui.run(args.video, args.out, frames, fps, make, review=args.review)
     print(f"{n} labels in {args.out}")
     return 0
 
@@ -300,6 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--extra-labels", help="human labels from pbos label, comma-separated; override auto labels, "
                     "'not visible' answers become negatives. Labels inside the --val window are never trained on")
     bt.add_argument("--stride", type=int, default=1, help="use every Nth label")
+    bt.add_argument("--human-weight", type=int, default=5, help="repeat each human label this many times per epoch")
     bt.add_argument("--epochs", type=int, default=12)
     bt.add_argument("--batch", type=int, default=32)
     bt.add_argument("--workers", type=int, default=4)
@@ -315,6 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="random: unbiased frames (for evaluation); hard: frames inside gaps where the classical "
                          "tracker lost a ball in play (for training)")
     lb.add_argument("--auto-labels", help="auto labels used by --mode hard (default out/ball_dataset/<video>_auto.json)")
+    lb.add_argument("--review", action="store_true", help="walk the labels already in --out to confirm or fix them")
     lb.add_argument("--n", type=int, default=200)
     lb.add_argument("--seed", type=int, default=0)
     lb.add_argument("--calib", help="show a detector suggestion ring (needs the calibration)")

@@ -162,6 +162,30 @@ arcs). Both models learned from auto-labels, which only contain frames the class
 already handled. The hard frames (blur, occlusion, slow balls) are what's missing, and the
 auto-label precision/recall rows are biased for the same reason.
 
+**Against human labels** (the fair test: 250 random frames from 380–460 s labelled by hand,
+216 with the ball visible; 5 px tolerance):
+
+| | Precision | Recall | F1 |
+|---|---|---|---|
+| Classical | 0.73 | 0.67 | 0.70 |
+| Learned v1 (auto labels), threshold 0.4 | 0.77 | 0.69 | **0.73** |
+| Learned v2 (+500 hand-labelled hard frames), threshold 0.4 | 0.77 | 0.66 | 0.71 |
+
+- **Auto labels inflated the earlier scores.** On human labels, classical drops from 0.84 to 0.70.
+- **The detectors fail on the same frames.** Taking classical *or* learned only raises the share
+  with the ball among the candidates from 70% to 71%.
+- **Most shared misses aren't detector failures.** Both miss 62 of the 216 visible frames, and
+  inspecting them shows mostly balls hidden behind a player (labelled where the ball should be),
+  balls held in a hand between points, and small balls in the far half (50 of the 62).
+- **v2 didn't improve yet**, for two fixable reasons: guessed positions of hidden balls teach the
+  model to fire on shirts, and 384 human positives are swamped by 5,474 auto labels (`--human-weight`,
+  default 5, now repeats them).
+- **Caveat:** the best thresholds were picked on this same test set, so the learned rows are slightly
+  optimistic. At the default 0.7, v1 scores F1 0.69 and v2 0.58: hand labels made v2 less confident
+  overall.
+
+The classical detector stays the default. The learned one isn't yet worth its ~30 ms per frame.
+
 **Training environment.** Training doesn't need the project's ONNX Runtime environment, just
 PyTorch. If PyTorch with CUDA is already installed in another Python, reuse it instead of
 downloading it again:
@@ -196,12 +220,18 @@ Two kinds of labels, kept apart in time so the test stays fair:
 .venv/Scripts/pbos ball-eval --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json     --labels out/ball_dataset/dsrgtsdg_test.json --ball-model models/ballnet_v2/ballnet.onnx --device cuda
 ```
 
+**What counts as visible:** you can see at least part of the ball (a blurred streak counts; click
+its middle). Press **n** when it is hidden behind a player or paddle, held in a hand or pocket between
+points, or out of frame. Never click where you *think* the ball is: guessed positions teach the model
+to fire on shirts. To fix labels already made, add `--review`: it walks the existing labels in `--out`,
+showing each answer as the ring (or "NOT VISIBLE"). Enter keeps it, a click moves it, n marks it hidden.
+
 In the window: **left-click** on the ball's centre (the loupe in the corner magnifies the area under
 the cursor). Press **Enter/Space** if the yellow suggestion ring is already right, **n** if the ball isn't
-visible (hidden, out of frame, between points), **s** to skip a frame you're unsure about, **b** to go
+visible (see above), **s** to skip a frame you're unsure about, **b** to go
 back, and **q** to stop. Every answer is saved immediately; running the same command again resumes
-where you left off. Click the ball itself, not its shadow or motion streak, and use **n** freely: "not
-visible" frames teach the model when *not* to fire. A blurry streak counts as visible, so click its middle.
+where you left off. Click the ball itself, not its shadow, and use **n** freely: "not visible" frames
+teach the model when *not* to fire.
 
 Next steps, in order of impact:
 1. **Human labels**, as above: a random test set for honest numbers and hard frames for training.
