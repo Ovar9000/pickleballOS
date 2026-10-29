@@ -1,0 +1,23 @@
+# Video and raw media never go in the repo (privacy + third-party footage)
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+/*.jpg
+/*.png
+/samples/
+
+# Local data
+*.db
+*.db-wal
+*.db-shm
+out/
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+build/
+dist/

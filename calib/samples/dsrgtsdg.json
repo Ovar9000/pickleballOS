@@ -1,0 +1,51 @@
+{
+  "court_id": "dsrgtsdg",
+  "created_at": "2026-10-29T05:22:12+00:00",
+  "image_size": [
+    1280,
+    720
+  ],
+  "units": "feet",
+  "origin": "near-left baseline corner (camera side); x across, y along, net at y=22",
+  "H_image_to_court": [
+    [
+      -0.006955939153455209,
+      0.021592914312670578,
+      -11.700753586303781
+    ],
+    [
+      0.012126829674825907,
+      0.00858686482820166,
+      -16.16039087764038
+    ],
+    [
+      -4.109068745216429e-05,
+      -0.0026450926747446316,
+      1.0
+    ]
+  ],
+  "image_points": {
+    "near_left_kitchen": [
+      175.0,
+      600.0
+    ],
+    "near_center_kitchen": [
+      487.0,
+      517.0
+    ],
+    "near_right_kitchen": [
+      634.0,
+      478.0
+    ],
+    "near_center_baseline": [
+      920.0,
+      577.0
+    ],
+    "near_right_corner": [
+      977.0,
+      506.0
+    ]
+  },
+  "rms_err_ft": 0.09292349834943185,
+  "max_err_ft": 0.12792604963307666
+}
