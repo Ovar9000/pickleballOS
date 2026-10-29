@@ -17,7 +17,9 @@ import cv2
 import numpy as np
 
 from . import court
+from .ball import BallDetector, BallTracker, detection_roi
 from .calibration import Calibration
+from .camera3d import Camera3D, CameraModelError
 from .camera_motion import CameraMotionMonitor
 from .eventlog import EventLog
 from .players import PersonDetection, PlayerDetector
@@ -105,6 +107,13 @@ def detect_players(frame: np.ndarray, detector: PlayerDetector, calib: Calibrati
     return [PersonDetection(b, k, s) for b, k, s in zip(boxes, kps, scores)]
 
 
+def camera_or_none(calib: Calibration) -> Camera3D | None:
+    try:
+        return Camera3D.from_calibration(calib)
+    except CameraModelError:
+        return None  # ball is still tracked in 2D and bounces are still placed; no 3D arcs or speed
+
+
 def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | None = None,
               out_video: str | None = None, db_path: str | None = None, cfg: TrackConfig | None = None,
               detector: PlayerDetector | None = None, progress: bool = True) -> dict:
@@ -139,6 +148,14 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
     cues: Counter = Counter()
     camera_events = []
     active_calib = calib
+    camera3d = camera_or_none(calib)
+    ball_det = BallDetector()
+    ball_det.set_roi(detection_roi(calib))
+    ball_tr = BallTracker(calib, camera3d)
+    ball_shift = 0.0  # camera shift the ball geometry was last rebuilt for
+    ball_seen = -1e9
+    bounces: list[tuple[float, np.ndarray]] = []
+    ball_stats: Counter = Counter()
 
     frames = range(n_frames)
     if progress:
@@ -170,6 +187,15 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
                                   extra={"shift_px": st.shift_px, "inliers": st.inliers})
             cam_status = st.status
             active_calib = st.calib
+            if st.status == "lost":
+                ball_det.reset()
+            else:
+                shift = st.shift_px if st.status == "rebased" else 0.0
+                if abs(shift - ball_shift) > 1.5:  # rebuilding the 3D camera + masks costs ~50 ms
+                    camera3d = camera_or_none(active_calib)
+                    ball_tr.set_geometry(active_calib, camera3d)
+                    ball_det.set_roi(detection_roi(active_calib))
+                    ball_shift = shift
         timings["camera"] += time.perf_counter() - t0
 
         measurements = None
@@ -193,10 +219,39 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
                 log.add_position(sid, t, slot, float(tr.xy[0]), float(tr.xy[1]))
         timings["track"] += time.perf_counter() - t0
 
+        t0 = time.perf_counter()
+        bs = ball_tr.update(t, ball_det(frame) if cam_status != "lost" else [])
+        if bs.uv is not None:
+            ball_seen = t
+            ball_stats["frames_detected"] += 1
+        if bs.xyz is not None:
+            ball_stats["frames_3d"] += 1
+        for e in bs.events:
+            ball_stats[e.kind] += 1
+            hitter = None
+            if e.kind == "hit" and e.court_xy is not None and players:
+                slot, p = min(players.items(), key=lambda kv: np.linalg.norm(kv[1].xy - e.court_xy))
+                hitter = slot if np.linalg.norm(p.xy - e.court_xy) < 8.0 else None
+            if e.kind == "bounce":
+                bounces = [b for b in bounces if t - b[0] < 3.0] + [(e.t, e.court_xy)]
+            if log:
+                log.add_event(sid, e.t, "bounce" if e.kind == "bounce" else "contact", slot=hitter,
+                              court_xy=e.court_xy, img_uv=e.uv, source="vision",
+                              extra={"speed_mph_est": e.speed_mph})
+        timings["ball"] += time.perf_counter() - t0
+
         if sink:
             t0 = time.perf_counter()
+            fresh = t - ball_seen < 0.1
+            ball_view = {
+                "uv": bs.uv, "trail": bs.trail if t - ball_seen < 0.3 else [],
+                # Ground track from the 3D arc, only while the ball is actually being seen.
+                "xy": bs.xyz[:2] if bs.xyz is not None and fresh and -0.5 < bs.xyz[2] < 30 else None,
+                "mph": bs.last_mph,
+                "bounces": [(xy, 1 - (t - tb) / 3.0) for tb, xy in bounces if 0 <= t - tb < 3.0],
+            }
             view = render_frame(frame, active_calib, {s: {"xy": tr.xy, "box": tr.box} for s, tr in players.items()},
-                                {s: m.total_ft for s, m in meters.items()}, cam_status)
+                                {s: m.total_ft for s, m in meters.items()}, cam_status, ball_view)
             timings["render"] += time.perf_counter() - t0
             t0 = time.perf_counter()
             sink.write(view)
@@ -219,6 +274,11 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
         "distance_ft_est": {s: round(m.total_ft, 1) for s, m in sorted(meters.items())},
         "distance_rejected_jumps": {s: m.rejected_jumps for s, m in sorted(meters.items())},
         "ground_point_cues": dict(cues),
+        "ball": {**dict(ball_stats),
+                 "detected_share": round(ball_stats["frames_detected"] / max(done, 1), 3),
+                 "fitted_3d_share": round(ball_stats["frames_3d"] / max(done, 1), 3),
+                 "camera_focal_px": round(camera3d.focal_px, 1) if camera3d else None,
+                 "camera_position_ft": [round(v, 1) for v in camera3d.center] if camera3d else None},
         "camera_events": camera_events,
         "ms_per_frame": per_frame_ms,
         "analysis_fps": round(1000 / analysis_ms, 1) if analysis_ms else None,

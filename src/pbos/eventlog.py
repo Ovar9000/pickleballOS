@@ -60,12 +60,14 @@ class EventLog:
                           (session_id, round(ts, 3), slot, x, y, conf))
 
     def add_event(self, session_id: str, ts: float, type: str, frame: int | None = None, slot: str | None = None,
-                  court_xy=None, source: str = "vision", conf: float | None = None, extra: dict | None = None) -> int:
-        x, y = (court_xy if court_xy is not None else (None, None))
+                  court_xy=None, img_uv=None, source: str = "vision", conf: float | None = None,
+                  extra: dict | None = None) -> int:
+        x, y = (float(court_xy[0]), float(court_xy[1])) if court_xy is not None else (None, None)
+        u, v = (float(img_uv[0]), float(img_uv[1])) if img_uv is not None else (None, None)
         cur = self.conn.execute(
-            "INSERT INTO events (session_id, ts, frame, type, slot, court_x, court_y, conf, source, extra)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (session_id, ts, frame, type, slot, x, y, conf, source, json.dumps(extra) if extra else None))
+            "INSERT INTO events (session_id, ts, frame, type, slot, court_x, court_y, img_u, img_v, conf, source, extra)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (session_id, ts, frame, type, slot, x, y, u, v, conf, source, json.dumps(extra) if extra else None))
         return int(cur.lastrowid)
 
     def commit(self) -> None:

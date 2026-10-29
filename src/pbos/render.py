@@ -54,7 +54,32 @@ def draw_tag(img: np.ndarray, box: np.ndarray, label: str, color) -> None:
     _text(img, label, (x + 10, y + 16), 0.5, TEXT, 1)
 
 
-def draw_court_map(img: np.ndarray, players: dict[str, np.ndarray], x: int, y: int, px_per_ft: float = 4.0) -> None:
+BALL = (40, 235, 255)  # optic yellow (BGR)
+
+
+def draw_ball(img: np.ndarray, uv, trail) -> None:
+    """Fading trail of recent detections plus a ring on the current one."""
+    pts = [np.round(p).astype(int) for p in trail]
+    for k in range(1, len(pts)):
+        a = k / len(pts)
+        cv2.line(img, tuple(pts[k - 1]), tuple(pts[k]), tuple(int(c * a) for c in BALL), 2, cv2.LINE_AA)
+    if uv is not None:
+        cv2.circle(img, tuple(np.round(uv).astype(int)), 9, BALL, 2, cv2.LINE_AA)
+
+
+def draw_speed_card(img: np.ndarray, mph: float | None, x: int, y: int) -> None:
+    w, h = 250, 92
+    _panel(img, x, y, w, h)
+    cv2.line(img, (x + 6, y + 10), (x + 6, y + 30), BALL, 3)
+    _text(img, "BALL SPEED", (x + 16, y + 26), 0.55, TEXT, 1)
+    val = f"~{mph:.0f}" if mph is not None else "--"
+    _text(img, val, (x + 16, y + 64), 1.1, TEXT, 2)
+    _text(img, "MPH", (x + 190, y + 62), 0.55, BALL, 2)
+    _text(img, "AVG HORIZONTAL - EST.", (x + 16, y + 84), 0.36, MUTED)
+
+
+def draw_court_map(img: np.ndarray, players: dict[str, np.ndarray], x: int, y: int, px_per_ft: float = 4.0,
+                   ball_xy=None, bounces=()) -> None:
     cw, ch = int(court.WIDTH_FT * px_per_ft), int(court.LENGTH_FT * px_per_ft)
     pad, top = 14, 26
     w, h = cw + 2 * pad, ch + top + pad + 16
@@ -68,6 +93,17 @@ def draw_court_map(img: np.ndarray, players: dict[str, np.ndarray], x: int, y: i
     for a, b in court.LINES:
         cv2.line(img, p(*a), p(*b), (170, 170, 170), 1, cv2.LINE_AA)
     cv2.line(img, p(*court.NET[0]), p(*court.NET[1]), (210, 210, 210), 1, cv2.LINE_AA)
+
+    def clip(xy):
+        return float(np.clip(xy[0], -2, court.WIDTH_FT + 2)), float(np.clip(xy[1], -3, court.LENGTH_FT + 3))
+
+    for bxy, alpha in bounces:  # recent bounces as fading crosses (exact ground points)
+        c = tuple(int(v * alpha + 60 * (1 - alpha)) for v in BALL)
+        q = p(*clip(bxy))
+        cv2.line(img, (q[0] - 3, q[1] - 3), (q[0] + 3, q[1] + 3), c, 1, cv2.LINE_AA)
+        cv2.line(img, (q[0] - 3, q[1] + 3), (q[0] + 3, q[1] - 3), c, 1, cv2.LINE_AA)
+    if ball_xy is not None:
+        cv2.circle(img, p(*clip(ball_xy)), 3, BALL, -1, cv2.LINE_AA)
     for slot, xy in players.items():
         cx = float(np.clip(xy[0], -2, court.WIDTH_FT + 2))
         cy = float(np.clip(xy[1], -3, court.LENGTH_FT + 3))
@@ -91,8 +127,9 @@ def draw_distance_panel(img: np.ndarray, distances: dict[str, float], x: int, y:
 
 
 def render_frame(frame: np.ndarray, calib: Calibration, players: dict[str, dict], distances: dict[str, float],
-                 camera_status: str = "steady") -> np.ndarray:
-    """players: slot -> {"xy": court ft, "box": px box or None}."""
+                 camera_status: str = "steady", ball: dict | None = None) -> np.ndarray:
+    """players: slot -> {"xy": court ft, "box": px box or None}.
+    ball: {"uv", "trail", "xy" (estimated ground track or None), "mph", "bounces": [(xy, alpha)]}."""
     img = frame.copy()
     for slot, p in players.items():
         draw_floor_ring(img, calib, p["xy"], SLOT_COLORS[slot])
@@ -100,8 +137,13 @@ def render_frame(frame: np.ndarray, calib: Calibration, players: dict[str, dict]
         if p.get("box") is not None:
             draw_tag(img, p["box"], slot, SLOT_COLORS[slot])
     H, W = img.shape[:2]
+    ball = ball or {}
+    if ball:
+        draw_ball(img, ball.get("uv"), ball.get("trail", []))
+    draw_speed_card(img, ball.get("mph"), W - 16 - 250, 170)
     draw_distance_panel(img, distances, 16, H - 160)
-    draw_court_map(img, {s: p["xy"] for s, p in players.items()}, W - 16 - 108, H - 16 - 234)
+    draw_court_map(img, {s: p["xy"] for s, p in players.items()}, W - 16 - 108, H - 16 - 234,
+                   ball_xy=ball.get("xy"), bounces=ball.get("bounces", ()))
     footer = "ESTIMATED MOTION - pickleballOS"
     if camera_status == "rebased":
         footer = "CAMERA MOVED - CALIBRATION RE-ALIGNED - " + footer

@@ -81,6 +81,21 @@ are off by several feet (far players show up beyond the far baseline). Re-click 
 both halves, e.g. `pbos calibrate --video dsrgtsdg.mp4 --at 492 --out calib/dsrgtsdg_492.json`, and
 run tracking from 480 s.
 
+## Phase 4 (part 1) — ball, bounces, speed
+
+Runs inside `pbos track`. The ball is found with classical vision (moving + optic-yellow + ball-sized
+blobs, no training data). The court homography can't place a ball that is in the air, so the
+tool recovers the full 3D camera from the calibration and fits each flight with a gravity arc.
+That gives the ball's ground track on the court map and its horizontal speed. Bounces are placed
+exactly through the homography at touchdown and logged with the hits in the `events` table.
+
+On the sample (420–500 s, including dead time and a 10 s cut-away): ball found in 53% of frames,
+3D arc in 41%, 16 bounces and 24 hits logged. The recovered camera is about 5 ft high, 7 ft outside
+the near sideline, with a ~660 px focal length (≈ 88° wide lens); the projected net tape lands on the
+real one. Dink speeds read 7–20 mph horizontal. CPU cost: 6 ms/frame; the whole pipeline analyses
+at 25.5 fps on CPU. Speeds are estimates (drag is ignored) and haven't been checked against ground
+truth yet.
+
 ## Status
 
 | Phase | | |
@@ -88,6 +103,6 @@ run tracking from 480 s.
 | 1 | DESIGN.md | done (v0.2, decisions folded in) |
 | 2 | Calibration tool + leave-one-out accuracy | done |
 | 3 | Player tracking → positions → distance, court map, camera-move check | done |
-| 4 | Ball tracking, bounces, audio contacts | next |
+| 4 | Ball tracking, 3D arcs, bounces, speed | done · audio contacts next |
 
 License: [MIT](LICENSE).
