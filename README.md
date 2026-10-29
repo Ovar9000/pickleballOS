@@ -8,6 +8,7 @@ Architecture, decisions, risks and evaluation plan: **[DESIGN.md](DESIGN.md)**.
 ```bash
 python -m venv .venv
 .venv/Scripts/python -m pip install -e ".[dev]"     # Windows; use .venv/bin/python on Linux/macOS
+.venv/Scripts/python -m pip install --no-deps rtmlib  # its opencv-contrib dep clashes with opencv-python
 .venv/Scripts/python -m pytest
 ```
 
@@ -54,12 +55,39 @@ which was not clicked, lands on the real net). It is valid for
 is the sideline closest to the camera. Any consistent choice works; it only fixes which way the court
 map is drawn.
 
+## Phase 3 — player tracking, distance, court map
+
+```bash
+pbos track --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json --start 420 --end 500
+```
+
+What it does per frame: YOLOX person detection (every `--det-every` frames) → drop people outside
+the court → RTMPose ankles for the rest → ankle midpoint through the homography → Kalman tracker in
+court feet → P1–P4 slots → distance covered. A camera-move check (a cheap per-frame scene-change test,
+plus an ORB check each second) re-aligns the calibration when the camera is re-aimed and pauses
+tracking during cut-aways. Models download to `~/.cache/rtmlib` on first run.
+
+Outputs in `out/` (git-ignored): `<video>_track.mp4` (overlay with source audio), `<video>.db`
+(SQLite: session, 10 Hz positions, camera events) and `<video>_track_summary.json` (distances,
+camera events, ms per stage, FPS).
+
+Measured on the sample (420–500 s, CPU only, Ryzen 7 5800H, 1280×720, detector every 2nd frame):
+**34.5 fps analysis** (decode 2.7, camera 1.9, detect 10.7, pose 13.0, track 0.6 ms/frame), 26 fps
+including overlay render + H.264 encode. It caught the 10 s cut-away at 430 s and the camera
+re-aim at 475 s.
+
+Known limitation of the sample: its calibration only has near-half points, so far-court positions
+are off by several feet (far players show up beyond the far baseline). Re-click it with points on
+both halves, e.g. `pbos calibrate --video dsrgtsdg.mp4 --at 492 --out calib/dsrgtsdg_492.json`, and
+run tracking from 480 s.
+
 ## Status
 
 | Phase | | |
 |---|---|---|
 | 1 | DESIGN.md | done (v0.2, decisions folded in) |
 | 2 | Calibration tool + leave-one-out accuracy | done |
-| 3 | Player tracking (RT-DETR + RTMPose) → positions → distance | next |
+| 3 | Player tracking → positions → distance, court map, camera-move check | done |
+| 4 | Ball tracking, bounces, audio contacts | next |
 
 License: [MIT](LICENSE).

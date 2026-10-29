@@ -94,6 +94,20 @@ class Calibration:
         _, w = _apply(self.H_inv, np.array([[court.CENTER_X, court.NET_Y]]))
         return float(np.sign(w[0]))
 
+    def rebased(self, G: np.ndarray) -> Calibration:
+        """Calibration for the same court after the image moved by homography G (old px -> new px)."""
+        H = self.H @ np.linalg.inv(G)
+        moved, _ = _apply(G, list(self.image_points.values()))
+        pts = {k: (float(u), float(v)) for k, (u, v) in zip(self.image_points, moved)}
+        return Calibration(H=H / H[2, 2], image_size=self.image_size, image_points=pts,
+                           court_id=self.court_id, created_at=self.created_at)
+
+    def ft_per_px(self, uv) -> float:
+        """Local scale at an image point: how many court feet one pixel spans there."""
+        u, v = float(uv[0]), float(uv[1])
+        p = self.image_to_court([[u, v], [u + 1, v], [u, v + 1]])
+        return float((np.linalg.norm(p[1] - p[0]) + np.linalg.norm(p[2] - p[0])) / 2)
+
     def image_to_court(self, pts) -> np.ndarray:
         out, _ = _apply(self.H, pts)
         return out

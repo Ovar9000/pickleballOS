@@ -238,7 +238,7 @@ them to an identity or to any other session.
 
 | Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
-| Player detector | **RT-DETR / RT-DETRv2** (R18 backbone, COCO `person`, Apache-2.0) as the reference detector; a small CNN detector (RTMDet-tiny or YOLOX-tiny, Apache-2.0) as the low-compute candidate | Ultralytics YOLO11 (**AGPL-3.0**, rejected); generic DETR (too slow) | RT-DETR is accurate, permissive, exports to ONNX and has Hugging Face support. NMS was never a bottleneck with 4 players, but it costs more compute than a tiny CNN and its deformable attention (`grid_sample`) may not compile for NPUs. Comparing the two on accuracy vs FPS is itself an RQ experiment (§11). |
+| Player detector | **YOLOX-tiny** (via rtmlib, Apache-2.0) as the working default; DETR-family models (RT-DETRv2, D-FINE, RF-DETR) as benchmark candidates, see the shortlist below | Ultralytics YOLO11 (**AGPL-3.0**, rejected) | YOLOX was ready as ONNX and already runs live on CPU (measured below). The detector sits behind `PlayerDetector`, so swapping is one class. Comparing detectors on accuracy vs FPS is itself an RQ experiment (§11). |
 | Player pose | **RTMPose-t/s** via rtmlib, top-down on the detected boxes (ONNX, Apache-2.0) | Box bottom-centre only (no pose); MediaPipe (single-person) | Ankles give a better ground point than the box edge; wrists help assign the hitter. "Box bottom vs ankle midpoint" is measured, not assumed. |
 | Multi-object tracking | Minimal **ByteTrack-style** tracker (Kalman + two-stage IoU association) re-implemented, plus court-space gating (≤4 on-court tracks, max speed) | DeepSORT (needs re-ID net), OC-SORT, BoT-SORT | Four players in a known area is an easy case; court-space constraints matter more than appearance. In-session appearance (color histogram) only to recover from occlusion swaps. |
 | Ball | **Classical baseline first** (background diff + color + blob shape + trajectory filter), then a **TrackNet-family heatmap model** (TrackNetV2/V3, WASB-style) fine-tuned on our footage | Generic object detector for the ball (poor on 3–10 px blurred blobs) | The classical tracker is needed anyway as a fallback and as the auto-labeler for the learned model. |
@@ -251,6 +251,20 @@ them to an identity or to any other session.
 | Performance score | **Logistic regression**, VAEP-style action valuation (§6) | Gradient boosting + SHAP; hand-tuned weights | Coefficients are the explanation; easy to publish. GBM is a robustness check, not the shipped model. |
 | Live delivery | MVP: frames (JPEG) + HudState over one **WebSocket** from the worker. Upgrade: MediaMTX WebRTC video + timestamped telemetry, synced with `requestVideoFrameCallback` | Burn overlays into an encoded stream (HLS) | MVP is trivially frame-synced and fine for a handful of LAN viewers; the upgrade scales to many viewers. |
 | Rendering | Overlays drawn from `HudState` by **two renderers** (OpenCV for offline MP4, canvas in browser) | Server-side burn-in only | Crisp vector HUD on any screen size; one data contract. |
+
+### Detector shortlist (licenses checked 2026-10-29)
+
+| Candidate | License | Family | Role |
+|---|---|---|---|
+| YOLOX-tiny / -m (rtmlib ONNX) | Apache-2.0 | CNN | **Phase 3 default.** Measured on CPU: ~21 ms per detection pass at 1280×720 (tiny) |
+| RT-DETRv2-S | Apache-2.0 | DETR | Accuracy reference |
+| D-FINE-N / -S | Apache-2.0 | DETR (RT-DETR lineage) | Smallest DETR option; community ONNX exports exist; one integrator (Frigate) reports no OpenVINO support yet, so check before relying on it for the Intel tier |
+| RF-DETR N / S / M / L | Apache-2.0 (**XL and 2XL are PML 1.0, excluded**) | DETR, DINOv2 backbone | Strong at fine-tuning; ~30M parameters even at Nano, so heavier on CPU |
+| YOLOv9 MIT rewrite (MultimediaTechLab/YOLO) | Code MIT; licence of the released weights not confirmed | CNN | Reserve until the weights' licence is confirmed |
+| PP-YOLOE+ | Apache-2.0 | CNN | Reserve: needs the Paddle toolchain and paddle2onnx |
+
+"NMS-free" is not a deciding factor here: with 4–12 people in frame, NMS takes microseconds. What
+decides is recall on small, partly occluded far-court players, and FPS per compute tier.
 
 ---
 
@@ -382,6 +396,8 @@ height); the event schema already allows `extra` 3D fields.
 | Overlapping players (partners) | ID swaps | Court-space gating, team-side constraint, in-session color histogram |
 | Outdoor sun, shadows, PH weather | Detection drop | Fixed-camera background model adapts slowly; evaluate indoor vs covered vs outdoor separately |
 | Wide-angle lens distortion | Homography error at frame edges | Residual report flags it; v2: fit radial distortion jointly with H |
+| Far half calibrated from near-half points only | Far positions off by several feet | **Observed in the sample**: the 5-point near-half calibration of `dsrgtsdg.mp4` puts far players at y ≈ 48–60 ft (the court ends at 44). Extrapolating a homography across the net amplifies small click errors. Fix: click intersections on both halves. Mitigations already in the tracker: identity uses the net side (which stays reliable) and enforces two players per side |
+| Bystanders near the court (referee, ball crew, spectators) | Taking a player slot | New tracks only start inside the lines (+1.5 ft at the sides); a third person on one side never gets a slot |
 | "Fixed" camera gets bumped / re-aimed | Every position silently wrong | **Observed in the sample**: `dsrgtsdg.mp4` is steady (≤ 2.3 px) until ~460 s, then shifts ~160 px. Phase 3 adds a camera-move check: ORB features on the static background vs the calibration frame every few seconds; small shift → re-base H through the frame-to-frame homography; large shift → pause stats and ask for re-calibration |
 | Far-court resolution (few px per ft) | In/out calls near far lines uncertain | Report bounce error by court zone; no line calling claims |
 | Too few matches for RQ (a) | Underpowered comparison | Simulation-based power estimate first; chronological CV; report CIs; negative result is still a result |
@@ -527,7 +543,7 @@ rating/gamification layer as extensions.
 |---|---|---|
 | 1 | DESIGN.md | this document |
 | 2 | Calibration tool (`pbos calibrate`), top-down verification, leave-one-out error | implemented |
-| 3 | Offline player tracking (RT-DETR + RTMPose + tracker) → court positions → distance + court-map overlay video; camera-move check | next |
+| 3 | Offline player tracking (detector + RTMPose + court-space tracker) → court positions → distance + court-map overlay video; camera-move check | implemented |
 | 4 | Ball tracking, bounces, audio contacts, fusion | |
 | 5 | Event log + stats with synthetic-event unit tests | |
 | 6 | HUD renderer (offline MP4 + web) in the reference style | |

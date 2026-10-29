@@ -74,6 +74,22 @@ def cmd_verify(args) -> int:
     return 0
 
 
+def cmd_track(args) -> int:
+    from .pipeline import TrackConfig, run_track
+
+    calib = Calibration.load(args.calib)
+    stem = Path(args.video).stem
+    out_video = None if args.no_video else (args.out or f"out/{stem}_track.mp4")
+    db = args.db or f"out/{stem}.db"
+    cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=args.device)
+    summary = run_track(args.video, calib, args.start, args.end, out_video, db, cfg)
+    summary_path = Path(db).with_name(f"{stem}_track_summary.json")
+    summary_path.write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
+    print(f"saved {db}" + (f"\nsaved {out_video}" if out_video else "") + f"\nsaved {summary_path}")
+    return 0
+
+
 def cmd_keypoints(_args) -> int:
     for name, (x, y) in court.KEYPOINTS.items():
         print(f"{name:<24} x={x:>5.1f} ft  y={y:>5.1f} ft")
@@ -99,6 +115,19 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--at", type=float, default=0.0)
     v.add_argument("--out")
     v.set_defaults(func=cmd_verify)
+
+    t = sub.add_parser("track", help="track players, log court positions, render the overlay video")
+    t.add_argument("--video", required=True)
+    t.add_argument("--calib", required=True, help="calibration JSON (valid at --start)")
+    t.add_argument("--start", type=float, default=0.0, help="seconds")
+    t.add_argument("--end", type=float, help="seconds (default: end of video)")
+    t.add_argument("--out", help="overlay video path (default: out/<video>_track.mp4)")
+    t.add_argument("--db", help="SQLite event log (default: out/<video>.db)")
+    t.add_argument("--no-video", action="store_true", help="skip rendering; positions and stats only")
+    t.add_argument("--det-every", type=int, default=2, help="run detector + pose every N frames")
+    t.add_argument("--mode", default="lightweight", choices=["lightweight", "balanced", "performance"])
+    t.add_argument("--device", default="cpu", help="cpu or cuda (needs onnxruntime-gpu)")
+    t.set_defaults(func=cmd_track)
 
     k = sub.add_parser("keypoints", help="list the court keypoint names and their court coordinates")
     k.set_defaults(func=cmd_keypoints)
