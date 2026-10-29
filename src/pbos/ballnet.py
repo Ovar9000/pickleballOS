@@ -78,7 +78,7 @@ def gaussian_heatmap(h: int, w: int, u: float, v: float, sigma: float) -> np.nda
 class TripletCrops(Dataset):
     def __init__(self, labels: list[BallLabel], frame_dir: str | Path, crop: int = 256, train: bool = True,
                  sigma: float = 2.0, image_size: tuple[int, int] = (1280, 720)):
-        self.labels = [lb for lb in labels if lb.visible]
+        self.labels = list(labels) if train else [lb for lb in labels if lb.visible]
         self.dir = Path(frame_dir)
         self.crop, self.train, self.sigma = crop, train, sigma
         self.w, self.h = image_size
@@ -91,8 +91,11 @@ class TripletCrops(Dataset):
         c = self.crop
         rng = random if self.train else random.Random(i)
         # Ball anywhere in the crop except the outer 16 px (train), centred-ish (val, deterministic).
-        x0 = int(np.clip(lb.u - rng.uniform(16, c - 16), 0, self.w - c))
-        y0 = int(np.clip(lb.v - rng.uniform(16, c - 16), 0, self.h - c))
+        # Negatives ("not visible") are cropped around their anchor, or anywhere if they have none.
+        cu = lb.u if lb.u >= 0 else rng.uniform(c / 2, self.w - c / 2)
+        cv = lb.v if lb.v >= 0 else rng.uniform(c / 2, self.h - c / 2)
+        x0 = int(np.clip(cu - rng.uniform(16, c - 16), 0, self.w - c))
+        y0 = int(np.clip(cv - rng.uniform(16, c - 16), 0, self.h - c))
         frames = [cv2.imread(str(self.dir / f"{lb.frame - k:06d}.jpg"))[y0:y0 + c, x0:x0 + c] for k in (2, 1, 0)]
         x = np.concatenate(frames, axis=2).astype(np.float32) / 255.0
         u, v = lb.u - x0, lb.v - y0
@@ -101,7 +104,7 @@ class TripletCrops(Dataset):
             if rng.random() < 0.5:
                 x = x[:, ::-1]
                 u = c - 1 - u
-        y = gaussian_heatmap(c, c, u, v, self.sigma)
+        y = gaussian_heatmap(c, c, u, v, self.sigma) if lb.visible else np.zeros((c, c), np.float32)
         return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))), torch.from_numpy(y[None])
 
 

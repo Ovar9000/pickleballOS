@@ -120,6 +120,44 @@ def cache_frames(video: str, frames: set[int], out_dir: str | Path, quality: int
     return out_dir
 
 
+def hard_frames(auto: list[BallLabel], fps: float, ranges: list[tuple[float, float]], n: int, seed: int = 0,
+                max_gap_s: float = 1.5) -> list[int]:
+    """Frames worth a human's time: inside short gaps between confident auto-labels.
+
+    A gap of up to `max_gap_s` between two confident positions means the ball was almost certainly in
+    play the whole time, so these are exactly the frames the classical detector lost: blur,
+    occlusion, slow balls at the top of an arc. Labelling them teaches a model what its teacher can't.
+    """
+    import random
+
+    frames = sorted(lb.frame for lb in auto)
+    gaps = [f for a, b in zip(frames, frames[1:]) if 1 < b - a <= max_gap_s * fps for f in range(a + 1, b)]
+    gaps = [f for f in gaps if any(r0 <= f / fps < r1 for r0, r1 in ranges)]
+    return sorted(random.Random(seed).sample(gaps, min(n, len(gaps))))
+
+
+def merge_labels(auto: list[BallLabel], human: list[BallLabel], fps: float, anchor_s: float = 1.5) -> list[BallLabel]:
+    """Auto labels plus human ones; a human label wins on the same frame.
+
+    "Not visible" answers become negative examples. They are anchored at the nearest confident ball
+    position in time (within `anchor_s`), so the model is shown the confusing spot: where the ball
+    just was or is about to be, with nothing to detect there now.
+    """
+    by_frame = {lb.frame: lb for lb in auto}
+    known = sorted(by_frame)
+    import bisect
+
+    for h in human:
+        if not h.visible and known:
+            k = bisect.bisect_left(known, h.frame)
+            near = [known[j] for j in (k - 1, k) if 0 <= j < len(known)]
+            f = min(near, key=lambda x: abs(x - h.frame))
+            if abs(f - h.frame) <= anchor_s * fps:
+                h = BallLabel(h.frame, by_frame[f].u, by_frame[f].v, False, h.source)
+        by_frame[h.frame] = h
+    return [by_frame[f] for f in sorted(by_frame)]
+
+
 def triplet_frames(labels: list[BallLabel]) -> set[int]:
     """Every frame a label needs: itself and the two before it (the model sees t-2, t-1, t)."""
     return {f - k for lb in labels for f in (lb.frame,) for k in (0, 1, 2) if f - k >= 0}

@@ -100,3 +100,35 @@ def test_focal_loss_prefers_a_peak_at_the_ball():
     assert focal_loss(good, target) < focal_loss(bad, target)
     out = BallNet()(torch.zeros(1, 9, 64, 64))
     assert out.shape == (1, 1, 64, 64)
+
+
+def test_hard_frames_come_from_short_gaps_between_confident_labels():
+    from pbos.balldata import hard_frames
+
+    auto = [BallLabel(f, 0, 0) for f in (100, 101, 102, 110, 111, 300, 301)]  # gaps: 102-110 (short), 111-300 (long)
+    pool = hard_frames(auto, 30.0, [(0, 100)], 1000)
+    assert pool == list(range(103, 110))  # the long gap is dead time, not a lost ball
+    assert hard_frames(auto, 30.0, [(5, 100)], 1000) == []  # outside the requested range
+
+
+def test_merge_human_overrides_auto_and_anchors_negatives():
+    from pbos.balldata import merge_labels
+
+    auto = [BallLabel(100, 10, 20), BallLabel(110, 50, 60)]
+    human = [BallLabel(100, 12, 21, True, "human"), BallLabel(108, -1, -1, False, "human"),
+             BallLabel(500, -1, -1, False, "human")]
+    merged = {lb.frame: lb for lb in merge_labels(auto, human, 30.0)}
+    assert (merged[100].u, merged[100].source) == (12, "human")
+    assert (merged[108].u, merged[108].v, merged[108].visible) == (50, 60, False)  # anchored at frame 110
+    assert merged[500].u == -1  # nothing confident within 1.5 s
+
+
+def test_negative_examples_have_an_empty_target(tmp_path):
+    pytest.importorskip("torch")
+    from pbos.ballnet import TripletCrops
+
+    for f in (8, 9, 10):
+        cv2.imwrite(str(tmp_path / f"{f:06d}.jpg"), np.full((720, 1280, 3), 90, np.uint8))
+    ds = TripletCrops([BallLabel(10, 600, 300, False, "human"), BallLabel(10, 600, 300)], tmp_path, crop=128)
+    (_, neg), (_, pos) = ds[0], ds[1]
+    assert float(neg.max()) == 0.0 and float(pos.max()) == 1.0

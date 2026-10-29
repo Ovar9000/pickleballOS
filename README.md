@@ -173,12 +173,38 @@ py -3.13 -m venv --system-site-packages .venv-gpu-train   # sees the system torc
 .venv-gpu-train/Scripts/pbos ball-train --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json --out models/ballnet_gpu
 ```
 
+### Labelling the ball (human labels)
+
+Two kinds of labels, kept apart in time so the test stays fair:
+
+| | Test set | Training set |
+|---|---|---|
+| Purpose | Honest precision/recall for any detector | Teach the model what the classical detector misses |
+| Frames | Random, from the held-out window 380–460 s | "Hard": inside short gaps where the tracker lost a ball in play |
+| Command | `--mode random --range 380-460` | `--mode hard --range 20-378,480-699` |
+| How many | 200–300 | 300–1000 (more is better) |
+
+```bash
+# 1. test set (random frames, held-out window)
+.venv/Scripts/pbos label --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json     --mode random --range 380-460 --n 250 --out out/ball_dataset/dsrgtsdg_test.json
+
+# 2. training set (hard frames, training ranges); the learned model draws the suggestion ring
+.venv/Scripts/pbos label --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json     --mode hard --range 20-378,480-699 --n 500 --out out/ball_dataset/dsrgtsdg_hard.json     --ball-model models/ballnet_gpu/ballnet.onnx --device cuda
+
+# 3. retrain with them, then compare on the test set
+.venv-gpu-train/Scripts/pbos ball-train --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json     --extra-labels out/ball_dataset/dsrgtsdg_hard.json --out models/ballnet_v2
+.venv/Scripts/pbos ball-eval --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json     --labels out/ball_dataset/dsrgtsdg_test.json --ball-model models/ballnet_v2/ballnet.onnx --device cuda
+```
+
+In the window: **left-click** on the ball's centre (the loupe in the corner magnifies the area under
+the cursor). Press **Enter/Space** if the yellow suggestion ring is already right, **n** if the ball isn't
+visible (hidden, out of frame, between points), **s** to skip a frame you're unsure about, **b** to go
+back, and **q** to stop. Every answer is saved immediately; running the same command again resumes
+where you left off. Click the ball itself, not its shadow or motion streak, and use **n** freely: "not
+visible" frames teach the model when *not* to fire. A blurry streak counts as visible, so click its middle.
+
 Next steps, in order of impact:
-1. **Human labels on hard frames.** `pbos label --video dsrgtsdg.mp4 --out out/ball_dataset/dsrgtsdg_gold.json --calib calib/samples/dsrgtsdg.json`
-   shows random frames from the held-out window with a suggestion ring. Click the ball, press
-   Enter to accept the ring, or `n` if it isn't visible. About 200–300 frames gives an unbiased
-   test set (`pbos ball-eval --labels ...gold.json`). More, from the training range, make the next
-   model better than its teacher.
+1. **Human labels**, as above: a random test set for honest numbers and hard frames for training.
 2. FP16 inference to bring the ~31 ms down.
 3. Use both detectors: classical candidates for recall and learned ones for precision, letting the
    tracker's arc check pick between them.

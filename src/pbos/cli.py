@@ -154,7 +154,7 @@ def _ball_detector_factory(kind: str, calib: Calibration, model: str | None, dev
 
 
 def cmd_ball_train(args) -> int:
-    from .balldata import autolabel, cache_frames, load_labels, save_labels, triplet_frames
+    from .balldata import autolabel, cache_frames, load_labels, merge_labels, save_labels, triplet_frames
 
     stem = Path(args.video).stem
     labels_path = Path(args.labels or f"out/ball_dataset/{stem}_auto.json")
@@ -164,17 +164,25 @@ def cmd_ball_train(args) -> int:
         save_labels(labels_path, args.video, fps, labels, {"ranges": args.ranges})
     meta, labels = load_labels(labels_path)
     fps = meta["fps"]
+    n_auto = len(labels)
+    human = []
+    for path in filter(None, (args.extra_labels or "").split(",")):
+        human += load_labels(path)[1]
+    labels = merge_labels(labels, human, fps)
     (v0, v1), = _parse_ranges(args.val)
     gap = 2.0  # seconds kept out on both sides of the validation window: neighbouring frames look alike
     val = [lb for lb in labels if v0 <= lb.frame / fps < v1][:: args.stride]
     train = [lb for lb in labels if not (v0 - gap <= lb.frame / fps < v1 + gap)][:: args.stride]
-    print(f"{len(labels)} auto labels -> train {len(train)}, val {len(val)} (every {args.stride}th)")
+    n_neg = sum(not lb.visible for lb in train)
+    print(f"{n_auto} auto + {len(human)} human labels -> train {len(train)} ({n_neg} negatives), "
+          f"val {len(val)} (every {args.stride}th)")
     frame_dir = cache_frames(args.video, triplet_frames(train + val), f"out/ball_dataset/frames_{stem}")
     from .ballnet import train as train_net
 
     report = train_net(train, val, frame_dir, args.out, epochs=args.epochs, batch=args.batch, workers=args.workers,
                        crop=args.crop)
-    report.update({"labels": str(labels_path), "val_window_s": [v0, v1]})
+    report.update({"labels": str(labels_path), "extra_labels": args.extra_labels, "human_labels": len(human),
+                   "val_window_s": [v0, v1]})
     Path(args.out, "train_report.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({k: report[k] for k in ("best_val_hit_rate", "train_labels", "val_labels", "device")}))
     print(f"saved {Path(args.out, 'ballnet.onnx')}")
@@ -187,8 +195,16 @@ def cmd_label(args) -> int:
     cap = cv2.VideoCapture(args.video)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
-    (r0, r1), = _parse_ranges(args.range)
-    frames = label_ui.sample_frames(fps, r0, r1, args.n, args.seed)
+    ranges = _parse_ranges(args.range)
+    if args.mode == "hard":
+        from .balldata import hard_frames, load_labels
+
+        auto_path = args.auto_labels or f"out/ball_dataset/{Path(args.video).stem}_auto.json"
+        frames = hard_frames(load_labels(auto_path)[1], fps, ranges, args.n, args.seed)
+    else:
+        per = -(-args.n // len(ranges))
+        frames = sorted(f for r0, r1 in ranges for f in label_ui.sample_frames(fps, r0, r1, per, args.seed))
+    print(f"{len(frames)} frames to label ({args.mode})")
     make = None
     if args.calib:
         kind = "learned" if args.ball_model else "classical"
@@ -281,6 +297,8 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--ranges", default="20-460,480-699", help="seconds to auto-label, e.g. 20-460,480-699")
     bt.add_argument("--val", default="380-460", help="validation window in seconds (kept out of training)")
     bt.add_argument("--labels", help="existing labels JSON (skips auto-labelling)")
+    bt.add_argument("--extra-labels", help="human labels from pbos label, comma-separated; override auto labels, "
+                    "'not visible' answers become negatives. Labels inside the --val window are never trained on")
     bt.add_argument("--stride", type=int, default=1, help="use every Nth label")
     bt.add_argument("--epochs", type=int, default=12)
     bt.add_argument("--batch", type=int, default=32)
@@ -292,7 +310,11 @@ def build_parser() -> argparse.ArgumentParser:
     lb = sub.add_parser("label", help="click the ball (or mark it hidden) on random frames: ground truth")
     lb.add_argument("--video", required=True)
     lb.add_argument("--out", required=True, help="labels JSON (created or resumed)")
-    lb.add_argument("--range", default="380-460", help="seconds to sample from, e.g. 380-460")
+    lb.add_argument("--range", default="380-460", help="seconds to sample from, e.g. 380-460 or 20-378,480-699")
+    lb.add_argument("--mode", default="random", choices=["random", "hard"],
+                    help="random: unbiased frames (for evaluation); hard: frames inside gaps where the classical "
+                         "tracker lost a ball in play (for training)")
+    lb.add_argument("--auto-labels", help="auto labels used by --mode hard (default out/ball_dataset/<video>_auto.json)")
     lb.add_argument("--n", type=int, default=200)
     lb.add_argument("--seed", type=int, default=0)
     lb.add_argument("--calib", help="show a detector suggestion ring (needs the calibration)")
