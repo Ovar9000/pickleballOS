@@ -39,8 +39,15 @@ pbos verify --calib calib/court1.json --video dsrgtsdg.mp4 --at 600
 ```
 
 Scripted / reproducible calibration (no window): `--points file.json` with `{"keypoint_name": [u, v]}`.
+**Accuracy without a tape measure.** The report shows two errors per keypoint. *Fit error* is how
+well the fitted court matches the clicks, which flatters the fit. *Held-out* error re-fits without that
+point and predicts it, using the painted lines as the ruler; that one is the honest accuracy estimate.
+Click as many of the 12 points as you can see: held-out error shrinks and becomes more stable with
+more points.
+
 `calib/samples/dsrgtsdg_points.json` is a 5-point example for the corner camera in `dsrgtsdg.mp4`
-(rms 0.09 ft; the re-projected net, which was not clicked, lands on the real net). It is valid for
+(fit 0.09 ft, held-out ~0.6 ft, because only 5 points on one half are visible; the re-projected net,
+which was not clicked, lands on the real net). It is valid for
 ~20–460 s of that video only: the camera is re-aimed at ~460 s, which `pbos verify --at 600` shows.
 
 **Naming for side/corner cameras:** "near" is the half the camera looks into most directly, "left"
@@ -51,6 +58,8 @@ map is drawn.
 
 | Phase | | |
 |---|---|---|
-| 1 | DESIGN.md | done (draft for review) |
-| 2 | Calibration tool | done |
-| 3+ | Player tracking onward | waiting for design review |
+| 1 | DESIGN.md | done (v0.2, decisions folded in) |
+| 2 | Calibration tool + leave-one-out accuracy | done |
+| 3 | Player tracking (RT-DETR + RTMPose) → positions → distance | next |
+
+License: [MIT](LICENSE).

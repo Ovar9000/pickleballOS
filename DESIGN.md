@@ -1,6 +1,10 @@
 # pickleballOS — Design
 
-**Status:** draft v0.1 · 2026-10-29 · for review before Phase 3 (player tracking) starts.
+**Status:** draft v0.2 · 2026-10-29 · decisions from the first review folded in (§14). License: MIT.
+
+**Primary research question (decided):** *How accurately can a single low-cost fixed camera and an
+open-source pipeline measure core pickleball stats, and how much compute does it take to do that
+live?* The rating question builds on this answer and is secondary (§13).
 
 A low-cost, privacy-first, fixed-camera system that watches a recreational pickleball doubles match, turns
 video + audio into an event log, and from that log produces (1) a live spectator HUD, (2) per-match
@@ -234,7 +238,8 @@ them to an identity or to any other session.
 
 | Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
-| Player detector + pose | **rtmlib** (RTMDet/YOLOX detector + RTMPose, ONNX, Apache-2.0) | Ultralytics YOLO11n-pose (**AGPL-3.0**); MediaPipe Pose (single-person); MMPose full stack (heavy deps) | Permissive license, ONNX-native so it runs on ORT/OpenVINO, small models available. YOLO11-pose is excellent and could be an optional backend if you accept AGPL (see §14). |
+| Player detector | **RT-DETR / RT-DETRv2** (R18 backbone, COCO `person`, Apache-2.0) as the reference detector; a small CNN detector (RTMDet-tiny or YOLOX-tiny, Apache-2.0) as the low-compute candidate | Ultralytics YOLO11 (**AGPL-3.0**, rejected); generic DETR (too slow) | RT-DETR is accurate, permissive, exports to ONNX and has Hugging Face support. NMS was never a bottleneck with 4 players, but it costs more compute than a tiny CNN and its deformable attention (`grid_sample`) may not compile for NPUs. Comparing the two on accuracy vs FPS is itself an RQ experiment (§11). |
+| Player pose | **RTMPose-t/s** via rtmlib, top-down on the detected boxes (ONNX, Apache-2.0) | Box bottom-centre only (no pose); MediaPipe (single-person) | Ankles give a better ground point than the box edge; wrists help assign the hitter. "Box bottom vs ankle midpoint" is measured, not assumed. |
 | Multi-object tracking | Minimal **ByteTrack-style** tracker (Kalman + two-stage IoU association) re-implemented, plus court-space gating (≤4 on-court tracks, max speed) | DeepSORT (needs re-ID net), OC-SORT, BoT-SORT | Four players in a known area is an easy case; court-space constraints matter more than appearance. In-session appearance (color histogram) only to recover from occlusion swaps. |
 | Ball | **Classical baseline first** (background diff + color + blob shape + trajectory filter), then a **TrackNet-family heatmap model** (TrackNetV2/V3, WASB-style) fine-tuned on our footage | Generic object detector for the ball (poor on 3–10 px blurred blobs) | The classical tracker is needed anyway as a fallback and as the auto-labeler for the learned model. |
 | Contacts | **Fused**: audio onset ∧ (ball direction change ∨ wrist–ball proximity) within ±2 frames | Audio only (adjacent courts pop too); vision only (misses occluded contacts) | Adjacent-court pops are rejected by requiring vision support; occluded contacts are kept when audio + wrist agree. |
@@ -333,7 +338,7 @@ data.
 |---|---|---|
 | 1 | Dev laptop (RTX 3060 Laptop, 6 GB) + recorded video | Correctness |
 | 2 | Same laptop + camera/RTSP (simulated with `ffmpeg -re` from a file) | Live tier at 30 fps, measured latency |
-| 3 | Edge box, Option A or B | FPS, latency, power, cost per court |
+| 3 (optional) | Edge box, Option A or B, only if one is ever bought | FPS, latency, power, cost per court |
 
 **Option A — Raspberry Pi 5 (8 GB) + AI HAT+ 26 TOPS (Hailo-8).** Cheapest and lowest power. Caveats:
 models must be compiled to HEF with Hailo's Dataflow Compiler (closed, x86 Linux, needs a calibration
@@ -345,10 +350,19 @@ web server all share 4 Cortex-A76 cores.
 OpenVINO and Quick Sync decode at roughly Pi-kit cost; a Core Ultra box adds an NPU at higher cost and
 power. Open toolchain, accepts our ONNX models as-is, x86 so the dev code runs unchanged.
 
-**Recommendation:** build and measure on **Option B (N-series + iGPU)** first — it removes toolchain
-risk from a single-student timeline and stays near the $300 line. Port to Option A only if RQ (c)
-becomes primary or power is a hard constraint; the `InferenceBackend` interface keeps that a contained
-job. Prices vary locally and should be checked at purchase time.
+**Decision: no hardware purchase is assumed.** There is no fixed budget and no venue commitment, so
+the compute side of the RQ is answered on the dev laptop at several **compute tiers**:
+
+| Tier | How it is emulated on the laptop | Stands in for |
+|---|---|---|
+| GPU | ONNX Runtime CUDA on the RTX 3060 | A venue PC with a discrete GPU |
+| CPU, 8 threads | ONNX Runtime / OpenVINO CPU, all cores | A mid-range mini-PC |
+| CPU, 4 threads, 720p | Same, thread-limited, smaller input | A budget mini-PC / Pi-class box |
+
+This gives honest "FPS and accuracy per tier" numbers without buying anything. If a device is bought
+later, Option B (x86 + OpenVINO) is the lower-risk port, since the same code runs unchanged; Option A
+(Pi 5 + Hailo) needs the closed compiler and may reject RT-DETR's attention ops. The
+`InferenceBackend` interface keeps either a contained job.
 
 **Camera:** 1080p at 60 fps with manual exposure (short shutter, ~1/1000 s) matters more than any
 model upgrade for ball tracking. Mount elevated (≥ 3–4 m ideally) behind a baseline corner so all four
@@ -378,18 +392,40 @@ height); the event schema already allows `extra` 3D fields.
 
 ## 11. Evaluation plan
 
+### The court is the ruler
+
+Distance accuracy does not need a tape measure on every point. The painted lines are a precisely
+known 20 × 44 ft reference that is in every frame, so error can be measured in three independent
+layers and added up:
+
+| Layer | Question | Ground truth (no ruler) | Metric |
+|---|---|---|---|
+| 1. Calibration | Does a ground pixel map to the right spot in feet? | **Leave-one-out** on the 12 line intersections: fit H without a point, predict it, compare with its known position. Implemented in `pbos calibrate`. | LOO error (ft), by court zone |
+| 2. Foot point | Is the detected ground point where the foot actually touches? | Human clicks the shoe–floor contact on sampled frames; both go through the *same* H | Court-space error (ft); ankle midpoint vs box bottom |
+| 3. Tracking + distance | Is distance covered right? | Path from human-clicked feet at 5 Hz on short clips; both paths resampled and smoothed the same way before summing | Distance error (% and ft per rally) |
+| Absolute check (optional) | Does it all hold in the real world? | Scripted walk along painted lines (sideline baseline→kitchen = 15 ft, perimeter = 128 ft), recorded once with a phone on a tripod and a consenting volunteer | Measured vs known path length |
+
+A tape measure is only needed if you want points *off* the lines (for example, a cone 3 ft behind the
+baseline), and that's a one-time five-minute check, not part of the main evaluation.
+
+### Full evaluation table
+
 | What | Ground truth | Metric |
 |---|---|---|
-| Calibration | Cones at known court coordinates in one frame | Reprojection error (ft), by zone |
-| Player positions | Feet clicked at 1 Hz on 3 × 3-min clips | Court-space error (ft), ID-switch count, MOTA |
-| Ball | Ball center clicked on ~1,500 frames (10 rallies, auto-prelabeled) | Detection precision/recall at ≤ 5 px, trajectory coverage % |
+| Calibration | Leave-one-out over line intersections | Error (ft), by zone |
+| Player positions | Shoe contact clicked at 1 Hz on 3 × 3-min clips | Court-space error (ft), ID switches, MOTA |
+| Distance covered | Clicked-feet path (above) | % error per rally |
+| Ball | Ball centre clicked on ~1,500 frames (10 rallies, auto-prelabelled) | Precision/recall at ≤ 5 px, trajectory coverage % |
 | Contacts / bounces | Event timestamps marked on ~20 rallies | Event F1 at ±2 frames; hitter accuracy; bounce position error (ft) |
 | Stats | Manual stat sheet for 5 games (third-shot type/result, dinks, errors) | Per-stat accuracy / MAE |
-| Rating (RQ a) | Game results, chronological split | Log loss + Brier vs OpenSkill win/loss-only baseline; bootstrap CIs; calibration plot |
-| System | — | FPS, glass-to-glass latency, watts, cost per court, per hardware option |
+| Compute (RQ) | — | FPS, latency, accuracy **per compute tier and per detector** (RT-DETR vs small CNN; ankle vs box bottom) |
+| Cloud comparison (optional) | Same game uploaded to a commercial tool, if affordable | Per-stat agreement |
+| Rating (secondary) | Simulated matches; real results if ever collected | Log loss + Brier vs win/loss-only baseline |
 
-Estimated labeling effort for one student: **~15–20 hours total** (ball ~6 h with prelabels, events
-~3 h, positions ~3 h, stat sheets ~5 h). Tools: a small click-labeler in this repo, or CVAT.
+**Data:** the public sample videos (local only, not redistributed) are the main evaluation set, since
+they need human labels but no participants. The optional scripted walk is the only own recording and
+still needs consent and an ethics check first. Estimated labelling effort: **~15–20 hours** (ball ~6 h
+with prelabels, events ~3 h, positions ~3 h, stat sheets ~5 h).
 
 ---
 
@@ -401,7 +437,8 @@ Estimated labeling effort for one student: **~15–20 hours total** (ball ~6 h w
 | NumPy / SciPy | BSD-3 | Numerics |
 | ONNX Runtime | MIT | Inference backend |
 | OpenVINO | Apache-2.0 | Inference backend |
-| rtmlib / RTMPose / RTMDet | Apache-2.0 | Player detection + pose |
+| RT-DETR / RT-DETRv2 (official repo, HF `transformers`) | Apache-2.0 | Reference player detector |
+| rtmlib / RTMPose / RTMDet | Apache-2.0 | Pose; small-CNN detector candidate |
 | ByteTrack (reference algorithm) | MIT | Re-implemented tracker |
 | librosa (or scipy.signal only) | ISC | Audio onsets |
 | scikit-learn | BSD-3 | Score model |
@@ -410,7 +447,7 @@ Estimated labeling effort for one student: **~15–20 hours total** (ball ~6 h w
 | MediaMTX | MIT | Optional WebRTC fan-out |
 | pytest | MIT | Tests |
 | TrackNetV3 / WASB code + weights | **verify before use** | Ball model (may retrain from scratch instead) |
-| Ultralytics YOLO11 | **AGPL-3.0** | Not used by default (see §14) |
+| Ultralytics YOLO11 | **AGPL-3.0** | Not used (decided, §14) |
 | HailoRT / Dataflow Compiler | HailoRT open (MIT/LGPL parts); DFC proprietary | Option A only |
 
 ---
@@ -419,8 +456,12 @@ Estimated labeling effort for one student: **~15–20 hours total** (ball ~6 h w
 
 ### Q1. Which research question should be primary?
 
-**Recommendation: (a) — does a stat-informed rating predict outcomes better than a win/loss-only
-rating — as primary, with (c) as a secondary, supporting contribution.**
+**Decided: (c) is primary**, reframed so it doesn't depend on buying hardware or on access to cloud
+tools: *how accurate are the core stats from one cheap fixed camera, and what compute does live
+operation need?* (a) stays as secondary work, since a stat-informed rating is only as trustworthy as
+the stats under it. The original reasoning for (a) is kept below for the record.
+
+Original recommendation: (a) as primary, with (c) as a secondary, supporting contribution.
 
 - (a) is what makes the system more than "a cheaper PB Vision": it is falsifiable with data the system
   itself produces, and it forces the rest (stats accuracy, credit assignment) to be good enough.
@@ -439,7 +480,8 @@ detectable effect *before* data collection.
 **Yes, for (a) and the minimum stat set.** Everything in it is a ground-plane quantity (positions,
 bounces) or a timing quantity (contacts, rally structure), and the homography is exact on the ground.
 What one camera cannot do: net clearance, contact height, true 3D ball speed. These are shown only as
-"est." or omitted. A second camera is only required if (c) is primary *and* you want to compare 3D stats.
+"est." or omitted. With (c) now primary, the RQ is scoped to these ground-plane and timing stats, so
+one camera is still enough. A second camera only becomes necessary if 3D stats are added to the scope.
 
 ### Q3. Ground truth — how much labeling is realistic?
 
@@ -463,32 +505,37 @@ robust primitives (positions, contacts, bounces) rather than on fragile ones (3D
 
 ---
 
-## 14. Open decisions (yours)
+## 14. Decisions (2026-10-29)
 
-1. **Primary RQ:** (a) recommended — confirm or pick (c).
-2. **AGPL:** OK to offer Ultralytics YOLO11-pose as an optional backend (repo must then be AGPL-compatible
-   if distributed with it), or stay strictly permissive (rtmlib only)?
-3. **Repository license:** MIT / Apache-2.0 / other (not added yet).
-4. **Edge budget:** is "~$300 per court including camera" the hard number?
-5. **Venue:** indoor, covered, or outdoor court for data collection? Changes lighting priorities.
+1. **Primary RQ:** (c), stat accuracy and compute cost (§13). Rating (a) is secondary.
+2. **Licenses:** strictly permissive. No Ultralytics/AGPL. Detector: RT-DETR / RT-DETRv2 (Apache-2.0),
+   compared against a small CNN detector.
+3. **Repository license:** MIT.
+4. **Budget / hardware:** none fixed, and building a physical system is not assumed. Compute is
+   measured at emulated tiers on the dev laptop (§9).
+5. **Data:** public sample footage for development, evaluation and a showcase demo. No venue data
+   collection is planned. The optional scripted-walk recording needs consent and an ethics check.
 
 ---
 
 ## 15. Phase plan
 
+Reordered for RQ (c): everything the accuracy and compute evaluation needs comes first, then the
+rating/gamification layer as extensions.
+
 | # | Deliverable | Status |
 |---|---|---|
 | 1 | DESIGN.md | this document |
-| 2 | Calibration tool (`pbos calibrate`) + top-down verification overlay | implemented |
-| 3 | Offline player tracking → court positions → distance + court-map overlay video | **paused for review** |
+| 2 | Calibration tool (`pbos calibrate`), top-down verification, leave-one-out error | implemented |
+| 3 | Offline player tracking (RT-DETR + RTMPose + tracker) → court positions → distance + court-map overlay video; camera-move check | next |
 | 4 | Ball tracking, bounces, audio contacts, fusion | |
 | 5 | Event log + stats with synthetic-event unit tests | |
 | 6 | HUD renderer (offline MP4 + web) in the reference style | |
-| 7 | Performance score training + importance report | |
-| 8 | OpenSkill rating, seasons, simulation | |
-| 9 | QR/NFC claim + scorer web flow | |
-| 10 | Real-time mode + edge measurements | |
-| 11 | Evaluation scripts | |
+| 7 | Labelling tool + evaluation scripts (layers 1–3, events, stats) | |
+| 8 | Real-time mode + compute-tier measurements | |
+| 9 | Performance score training + importance report | extension |
+| 10 | OpenSkill rating, seasons, simulation | extension |
+| 11 | QR/NFC claim + scorer web flow | extension |
 
 ---
 
@@ -499,8 +546,8 @@ speed only between contact/bounce endpoints, client-side HUD rendering, short lo
 `ffmpeg -re` to simulate a live camera, and the sample-video triage (`dsrgtsdg.mp4` as primary).
 
 Corrected / flagged:
-- **Ultralytics `yolo11n-pose` is AGPL-3.0**, which conflicts with the permissive-license rule — moved
-  to optional (§5, §14).
+- **Ultralytics `yolo11n-pose` is AGPL-3.0**, which conflicts with the permissive-license rule — replaced
+  by RT-DETR + RTMPose (§5, §14).
 - **"TrackNetV4-Lite"** is not a release I can confirm; treated here as "a TrackNet-family model, sized
   down", to be verified when Phase 4 starts.
 - Detection rates (75–85 %, 98 %+) and per-frame timings in that doc are estimates, not measurements.

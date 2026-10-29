@@ -7,6 +7,7 @@ name = "pickleballos"
 version = "0.1.0"
 description = "Low-cost, privacy-first pickleball analytics and ranking from a fixed camera"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",

@@ -120,6 +120,30 @@ class Calibration:
         r = np.array(list(self.residuals_ft().values()))
         return float(np.sqrt(np.mean(r**2))), float(r.max())
 
+    def leave_one_out_ft(self) -> dict[str, float]:
+        """Error (ft) predicting each keypoint from a fit that excludes it.
+
+        Unlike residuals, the tested point did not shape the fit, so this is an honest accuracy
+        estimate that needs no tape measure: the painted lines are the ruler. Points whose removal
+        leaves fewer than 4 usable points are skipped, so 4 clicks give an empty result.
+        """
+        out = {}
+        for name, uv in self.image_points.items():
+            rest = {k: v for k, v in self.image_points.items() if k != name}
+            try:
+                H = fit_homography(rest)
+            except CalibrationError:
+                continue
+            pred, _ = _apply(H, [uv])
+            out[name] = float(np.linalg.norm(pred[0] - np.array(court.KEYPOINTS[name])))
+        return out
+
+    def loo_summary(self) -> tuple[float, float] | None:
+        r = np.array(list(self.leave_one_out_ft().values()))
+        if r.size == 0:
+            return None
+        return float(np.sqrt(np.mean(r**2))), float(r.max())
+
     def court_mask(self, side_margin: float = 4.0, end_margin: float = 8.0) -> np.ndarray:
         """uint8 mask (255 = pixel sees the court plus margins). Used to ignore people off-court."""
         w_img, h_img = self.image_size
@@ -137,6 +161,7 @@ class Calibration:
 
     def to_dict(self) -> dict:
         rms, worst = self.error_summary()
+        loo = self.loo_summary()
         return {
             "court_id": self.court_id,
             "created_at": self.created_at,
@@ -147,6 +172,8 @@ class Calibration:
             "image_points": {k: list(v) for k, v in self.image_points.items()},
             "rms_err_ft": rms,
             "max_err_ft": worst,
+            "loo_rms_ft": loo[0] if loo else None,
+            "loo_max_ft": loo[1] if loo else None,
         }
 
     def save(self, path: str | Path) -> None:
@@ -245,7 +272,10 @@ def verification_image(frame: np.ndarray, calib: Calibration) -> np.ndarray:
     canvas = np.hstack([overlay, top])
     rms, worst = calib.error_summary()
     n = len(calib.image_points)
-    note = f"{n} keypoints | rms {rms:.2f} ft | max {worst:.2f} ft"
+    note = f"{n} keypoints | fit rms {rms:.2f} ft | max {worst:.2f} ft"
+    loo = calib.loo_summary()
+    if loo:
+        note += f" | leave-one-out rms {loo[0]:.2f} ft, max {loo[1]:.2f} ft"
     if n == MIN_POINTS:
         note += " | exactly 4 points: errors are 0 by construction, add more to check"
     cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 28), (20, 20, 20), -1)

@@ -28,13 +28,18 @@ def _write_image(path: str | Path, img) -> None:
 
 
 def _report(calib: Calibration) -> None:
-    print(f"{'keypoint':<24}{'error (ft)':>12}")
+    loo = calib.leave_one_out_ft()
+    print(f"{'keypoint':<24}{'fit err (ft)':>14}{'held-out (ft)':>15}")
     for name, err in calib.residuals_ft().items():
-        print(f"{name:<24}{err:>12.3f}")
+        held = f"{loo[name]:.3f}" if name in loo else "-"
+        print(f"{name:<24}{err:>14.3f}{held:>15}")
     rms, worst = calib.error_summary()
-    print(f"\n{len(calib.image_points)} points  rms {rms:.3f} ft  max {worst:.3f} ft")
-    if len(calib.image_points) == 4:
-        print("note: with exactly 4 points the errors are 0 by construction; click 6+ to get a real check")
+    print(f"\n{len(calib.image_points)} points  fit rms {rms:.3f} ft  max {worst:.3f} ft")
+    summary = calib.loo_summary()
+    if summary:
+        print(f"leave-one-out rms {summary[0]:.3f} ft  max {summary[1]:.3f} ft  (accuracy estimate, no ruler needed)")
+    else:
+        print("note: with exactly 4 points the fit is exact and can't be checked; click 6+ for a real check")
 
 
 def cmd_calibrate(args) -> int:

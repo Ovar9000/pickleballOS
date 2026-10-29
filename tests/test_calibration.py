@@ -55,6 +55,24 @@ def test_kitchen_points_only_is_enough():
     np.testing.assert_allclose(calib.image_to_court([far_corner_px])[0], (20.0, 44.0), atol=1e-4)
 
 
+def test_leave_one_out_is_empty_with_four_points():
+    calib = Calibration.from_points(synthetic_points(names=list(CORNER_PIXELS)), IMAGE_SIZE)
+    assert calib.leave_one_out_ft() == {}
+    assert calib.loo_summary() is None
+
+
+def test_leave_one_out_flags_a_bad_click():
+    pts = synthetic_points(noise_px=0.5)
+    u, v = pts["near_center_kitchen"]
+    pts["near_center_kitchen"] = (u + 30.0, v)  # a sloppy click
+    calib = Calibration.from_points(pts, IMAGE_SIZE)
+    loo = calib.leave_one_out_ft()
+    assert max(loo, key=loo.get) == "near_center_kitchen"
+    # The fit absorbs part of the bad click, so its residual understates what held-out testing shows.
+    assert loo["near_center_kitchen"] > calib.residuals_ft()["near_center_kitchen"]
+    assert loo["near_center_kitchen"] > 1.0
+
+
 def test_round_trip_image_court_image():
     calib = Calibration.from_points(synthetic_points(), IMAGE_SIZE)
     pts = np.array([[3.0, 5.0], [10.0, 22.0], [17.5, 40.0]])
