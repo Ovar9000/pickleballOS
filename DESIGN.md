@@ -242,6 +242,7 @@ them to an identity or to any other session.
 | Player pose | **RTMPose-t/s** via rtmlib, top-down on the detected boxes (ONNX, Apache-2.0) | Box bottom-centre only (no pose); MediaPipe (single-person) | Ankles give a better ground point than the box edge; wrists help assign the hitter. "Box bottom vs ankle midpoint" is measured, not assumed. |
 | Multi-object tracking | Minimal **ByteTrack-style** tracker (Kalman + two-stage IoU association) re-implemented, plus court-space gating (≤4 on-court tracks, max speed) | DeepSORT (needs re-ID net), OC-SORT, BoT-SORT | Four players in a known area is an easy case; court-space constraints matter more than appearance. In-session appearance (color histogram) only to recover from occlusion swaps. |
 | Ball | **Classical baseline first** (background diff + color + blob shape + trajectory filter), then a **TrackNet-family heatmap model** (TrackNetV2/V3, WASB-style) fine-tuned on our footage | Generic object detector for the ball (poor on 3–10 px blurred blobs) | The classical tracker is needed anyway as a fallback and as the auto-labeler for the learned model. |
+| Ball temporal context | In the tracker, not just the detector: (1) the fitted 3D arc predicts the next position and **coasts** through occlusions up to 0.5 s; (2) after a hit, the ball is searched for around its **last position** in a radius that grows with elapsed time; (3) where the track expects the ball, a **relaxed second detection pass** runs in a small window (blur washes out the colour). Events are emitted only for verified arcs | Per-frame nearest-neighbour linking (first version) | Measured on a 10 s rally: the first version split the track into 20 pieces (median ~10 frames) because 41 of 71 misses were hits leaving the predicted arc, not detection failures. Now it is one continuous track (297/299 frames, detections 228 → 252). A learned multi-frame model (TrackNet takes 3 stacked frames) is the next step for the remaining misses. |
 | Contacts | **Fused**: audio onset ∧ (ball direction change ∨ wrist–ball proximity) within ±2 frames | Audio only (adjacent courts pop too); vision only (misses occluded contacts) | Adjacent-court pops are rejected by requiring vision support; occluded contacts are kept when audio + wrist agree. |
 | Bounces | End of a fitted flight that finishes low and falling; the touchdown pixel is mapped through H | Image-velocity reversal only; learned bounce classifier | The ground point maps exactly through H, so 2D is enough for bounce position. |
 | Ball in the air (court-map position, speed) | **Single-view 3D**: recover the full camera (focal length + pose) from the court homography (Zhang's plane calibration, principal point at centre), then fit each flight between velocity changes with a ballistic arc under known gravity (linear least squares, 6 unknowns) | Mapping the ball pixel through H (wrong: it is not on the ground); a second synced camera | Gravity fixes the depth ambiguity: how fast the ball falls in the image depends on its distance. Validated by projecting the 34–36 in net tape, which was never used in the fit, onto the real tape. Drag is ignored, so speed and height are labelled estimates; a second camera remains the upgrade path for net clearance. |
@@ -265,8 +266,13 @@ them to an identity or to any other session.
 | YOLOv9 MIT rewrite (MultimediaTechLab/YOLO) | Code MIT; licence of the released weights not confirmed | CNN | Reserve until the weights' licence is confirmed |
 | PP-YOLOE+ | Apache-2.0 | CNN | Reserve: needs the Paddle toolchain and paddle2onnx |
 
-"NMS-free" is not a deciding factor here: with 4–12 people in frame, NMS takes microseconds. What
-decides is recall on small, partly occluded far-court players, and FPS per compute tier.
+**NMS matters more than expected (correction).** The NMS math is microseconds for 4–12 people, but
+rtmlib's YOLOX ONNX files bake NMS into the graph, and ONNX Runtime's CUDA NMS kernel measured
+**6.1 ms per call** on the RTX 3060 laptop, more than all the convolutions (4.9 ms). We now cut the
+graph before NMS (`strip_nms`) and do NMS on the CPU; boxes match the original within 0.11 px, and
+GPU detection went from 9.2 to 4.6 ms/frame. NMS-free models (D-FINE, RT-DETR, RF-DETR) avoid this
+by design, which is a real point in their favour for the GPU tier. Recall on small, partly
+occluded far-court players and FPS per tier still decide.
 
 ---
 
@@ -375,7 +381,21 @@ the compute side of the RQ is answered on the dev laptop at several **compute ti
 | CPU, 8 threads | ONNX Runtime / OpenVINO CPU, all cores | A mid-range mini-PC |
 | CPU, 4 threads, 720p | Same, thread-limited, smaller input | A budget mini-PC / Pi-class box |
 
-This gives honest "FPS and accuracy per tier" numbers without buying anything. If a device is bought
+This gives honest "FPS and accuracy per tier" numbers without buying anything.
+
+**Measured (2026-10-29, `pbos bench`, 20 s of `dsrgtsdg.mp4` from 455 s, 1280×720 at 29.97 fps,
+YOLOX-tiny + RTMPose-s every 2nd frame, classical ball every frame, ms per frame):**
+
+| Tier | Detect | Pose | Ball | Analysis fps | Real time |
+|---|---|---|---|---|---|
+| GPU, CUDA (RTX 3060 Laptop) | 4.8 | 11.6 | 4.8 | **40.1** | yes |
+| CPU, all threads (Ryzen 7 5800H) | 13.4 | 13.2 | 8.1 | 25.3 | no |
+| CPU, 4 threads | 16.4 | 15.4 | 6.5 | 23.4 | no |
+| CPU, 2 threads | 21.9 | 20.2 | 7.2 | 18.6 | no |
+
+CPU tiers reach real time by running the detector every 3rd frame (the tracker fills the gaps).
+Further GPU headroom is available (FP16, TensorRT, batching detection and pose), but it isn't needed
+for 30 fps. If a device is bought
 later, Option B (x86 + OpenVINO) is the lower-risk port, since the same code runs unchanged; Option A
 (Pi 5 + Hailo) needs the closed compiler and may reject RT-DETR's attention ops. The
 `InferenceBackend` interface keeps either a contained job.

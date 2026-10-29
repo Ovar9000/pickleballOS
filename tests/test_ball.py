@@ -82,6 +82,48 @@ def test_tracker_splits_flights_and_places_the_bounce():
     assert abs(bounces[0].speed_mph - np.hypot(*v0[:2]) * 3600 / 5280) < 2.0
 
 
+def test_track_survives_a_hit_and_a_short_occlusion():
+    # A dink from the far side to the near side, a 5-frame occlusion mid-flight, then a volley
+    # sends it back. The tracker must keep one continuous track: coast through the gap on the arc
+    # and pick the ball up again after the hit, where it leaves the predicted arc.
+    truth = true_camera()
+    calib = calib_from(truth)
+    cam = Camera3D.from_calibration(calib)
+    a = Flight(0.0, np.array([10.0, 30.0, 2.5]), np.array([0.5, -14.0, 12.0]), 0.0)
+    t_hit = 0.7
+    hit_at = a.position(t_hit)
+    b = Flight(t_hit, hit_at, np.array([-1.0, 18.0, 6.0]), 0.0)
+    tracker = BallTracker(calib, cam, acquire_mask=np.full((H, W), 255, np.uint8))
+    seen = coasting = 0
+    events = []
+    for k in range(int(1.3 * FPS)):
+        t = k / FPS
+        X = a.position(t) if t < t_hit else b.position(t)
+        occluded = 10 <= k < 15
+        st = tracker.update(t, [] if occluded else [BallCandidate(truth.project(X)[0], 20.0)])
+        events += st.events
+        seen += st.uv is not None
+        coasting += occluded and st.predicted_uv is not None
+    assert coasting == 5  # predicted through the whole occlusion
+    assert seen == int(1.3 * FPS) - 5  # every visible frame was linked, including after the hit
+    hits = [e for e in events if e.kind == "hit"]
+    assert len(hits) == 1 and abs(hits[0].t - t_hit) < 2.5 / FPS
+
+
+def test_relaxed_search_recovers_a_faint_ball_near_the_prediction():
+    det = BallDetector()
+    bg = np.full((H, W, 3), (120, 90, 60), np.uint8)
+    faint = (95, 118, 125)  # blurred ball: washed-out, darker yellow than the global thresholds accept
+    for k in range(3):
+        f = bg.copy()
+        cv2.circle(f, (400 + 30 * k, 300), 3, faint, -1)
+        found = det(f)
+    assert found == []  # too faint for the global thresholds
+    near = det.search_near(np.array([462.0, 302.0]), 20)
+    assert len(near) == 1
+    np.testing.assert_allclose(near[0].uv, (460, 300), atol=1.5)
+
+
 def test_detector_finds_a_moving_yellow_ball_not_a_static_one():
     det = BallDetector()
     bg = np.full((H, W, 3), (120, 90, 60), np.uint8)

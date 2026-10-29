@@ -41,14 +41,30 @@ class BallDetector:
         self.diff_thr = diff_thr
         self.min_area, self.max_area, self.max_side = min_area, max_area, max_side
         self.roi: tuple[int, int, int, int] | None = None  # x0, y0, x1, y1; None = whole frame
-        self._prev: list[np.ndarray] = []
+        self._grays: list[np.ndarray] = []  # last three blurred grey ROI crops, oldest first
+        self._frame: np.ndarray | None = None  # current colour ROI crop
 
     def reset(self) -> None:
-        self._prev.clear()
+        self._grays.clear()
 
     def set_roi(self, roi: tuple[int, int, int, int] | None) -> None:
         self.roi = roi
         self.reset()
+
+    def _blobs(self, grays, colour, diff_thr, hsv_lo, hsv_hi, min_area, max_area, offset) -> list[BallCandidate]:
+        cur, p1, p2 = grays[-1], grays[-2], grays[-3]
+        _, m1 = cv2.threshold(cv2.absdiff(cur, p1), diff_thr, 255, cv2.THRESH_BINARY)
+        _, m2 = cv2.threshold(cv2.absdiff(cur, p2), diff_thr, 255, cv2.THRESH_BINARY)
+        moving = cv2.bitwise_and(m1, m2)
+        yellow = cv2.inRange(cv2.cvtColor(colour, cv2.COLOR_BGR2HSV), hsv_lo, hsv_hi)
+        mask = cv2.bitwise_and(moving, cv2.dilate(yellow, np.ones((3, 3), np.uint8)))
+        n, _, stats, cents = cv2.connectedComponentsWithStats(mask)
+        out = []
+        for i in range(1, n):
+            area, w, h = stats[i, cv2.CC_STAT_AREA], stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+            if min_area <= area <= max_area and max(w, h) <= self.max_side:
+                out.append(BallCandidate(cents[i].astype(np.float64) + offset, float(area)))
+        return out
 
     def __call__(self, frame: np.ndarray) -> list[BallCandidate]:
         x0, y0 = 0, 0
@@ -56,22 +72,34 @@ class BallDetector:
             x0, y0, x1, y1 = self.roi
             frame = frame[y0:y1, x0:x1]
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (3, 3), 0)
-        prev = self._prev
-        self._prev = (prev + [gray])[-2:]
-        if len(prev) < 2 or prev[0].shape != gray.shape:
+        if self._grays and self._grays[-1].shape != gray.shape:
+            self._grays.clear()
+        self._grays = (self._grays + [gray])[-3:]
+        self._frame = frame
+        if len(self._grays) < 3:
             return []
-        _, m1 = cv2.threshold(cv2.absdiff(gray, prev[-1]), self.diff_thr, 255, cv2.THRESH_BINARY)
-        _, m2 = cv2.threshold(cv2.absdiff(gray, prev[-2]), self.diff_thr, 255, cv2.THRESH_BINARY)
-        moving = cv2.bitwise_and(m1, m2)
-        yellow = cv2.inRange(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), self.hsv_lo, self.hsv_hi)
-        mask = cv2.bitwise_and(moving, cv2.dilate(yellow, np.ones((3, 3), np.uint8)))
-        n, _, stats, cents = cv2.connectedComponentsWithStats(mask)
-        out = []
-        for i in range(1, n):
-            area, w, h = stats[i, cv2.CC_STAT_AREA], stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
-            if self.min_area <= area <= self.max_area and max(w, h) <= self.max_side:
-                out.append(BallCandidate(cents[i].astype(np.float64) + (x0, y0), float(area)))
-        return out
+        return self._blobs(self._grays, frame, self.diff_thr, self.hsv_lo, self.hsv_hi,
+                           self.min_area, self.max_area, np.array([x0, y0], dtype=np.float64))
+
+    def search_near(self, uv: np.ndarray, radius: float) -> list[BallCandidate]:
+        """Relaxed second look in a window where the tracker expects the ball (call after __call__).
+
+        Motion blur washes out the ball's colour and contrast, so the global thresholds miss it.
+        Near a confident prediction a fainter, less saturated blob is still most likely the ball.
+        """
+        if len(self._grays) < 3 or self._frame is None:
+            return []
+        x0, y0 = (self.roi[0], self.roi[1]) if self.roi is not None else (0, 0)
+        h, w = self._grays[-1].shape
+        cx, cy = uv[0] - x0, uv[1] - y0
+        r = int(radius)
+        a0, b0 = max(int(cx) - r, 0), max(int(cy) - r, 0)
+        a1, b1 = min(int(cx) + r, w), min(int(cy) + r, h)
+        if a1 - a0 < 4 or b1 - b0 < 4:
+            return []
+        crops = [g[b0:b1, a0:a1] for g in self._grays]
+        return self._blobs(crops, self._frame[b0:b1, a0:a1], max(self.diff_thr // 2, 6), (18, 35, 100),
+                           (50, 255, 255), 1, self.max_area, np.array([x0 + a0, y0 + b0], dtype=np.float64))
 
 
 @dataclass
@@ -89,9 +117,16 @@ class Flight:
     def horizontal_mph(self) -> float:
         return float(np.linalg.norm(self.v0[:2]) * FPS_TO_MPH)
 
-    def plausible(self) -> bool:
-        return (self.rms_px < 4.0 and -2.0 < self.p0[2] < 25.0 and self.horizontal_mph < 90.0
-                and -30 < self.p0[0] < 50 and -40 < self.p0[1] < 85)
+    def plausible(self, t_end: float | None = None) -> bool:
+        """Small residual, sane speed, and the arc stays around the court (and above the floor)
+        for the whole time it was observed."""
+        if not (self.rms_px < 4.0 and self.horizontal_mph < 90.0):
+            return False
+        for t in (self.t0, t_end if t_end is not None else self.t0):
+            x, y, z = self.position(t)
+            if not (-12 <= x <= court.WIDTH_FT + 12 and -15 <= y <= court.LENGTH_FT + 15 and -1.0 <= z <= 25.0):
+                return False
+        return True
 
 
 def fit_ballistic(ts, uvs, P: np.ndarray, iterations: int = 3) -> Flight:
@@ -134,6 +169,7 @@ class BallEvent:
 @dataclass
 class BallState:
     uv: np.ndarray | None = None  # detected this frame
+    predicted_uv: np.ndarray | None = None  # where the fitted arc puts it when not detected (coasting)
     trail: list = field(default_factory=list)
     xyz: np.ndarray | None = None  # 3D estimate (ft) from the current flight fit
     flight_mph: float | None = None  # current flight, horizontal
@@ -142,16 +178,31 @@ class BallState:
 
 
 class BallTracker:
-    """Links candidates into a track and splits it into flights at velocity changes."""
+    """Links candidates into a track and splits it into flights at velocity changes.
+
+    Temporal context comes from three places: the fitted arc predicts where the ball will be (and
+    lets the track coast through short occlusions); after a hit, when the ball leaves the arc, it
+    is searched for around its last position in a radius that grows with elapsed time; and
+    `search_hint` tells the detector where a relaxed second look is worthwhile.
+    """
 
     def __init__(self, calib: Calibration, camera: Camera3D | None, min_fit: int = 5, break_px: float = 7.0,
-                 gate_px: float = 45.0, max_gap_s: float = 0.3, acquire_mask: np.ndarray | None = None):
+                 gate_px: float = 45.0, max_gap_s: float = 0.3, max_coast_s: float = 0.5,
+                 reach_base_px: float = 20.0, reach_px_per_s: float = 1500.0, reach_max_px: float = 160.0,
+                 speed_min_points: int = 8, speed_max_mph: float = 70.0,
+                 acquire_mask: np.ndarray | None = None):
         self.calib = calib
+        self.speed_min_points = speed_min_points
+        self.speed_max_mph = speed_max_mph
         self.camera = camera
         self.min_fit = min_fit
         self.break_px = break_px
         self.gate_px = gate_px
         self.max_gap_s = max_gap_s
+        self.max_coast_s = max_coast_s
+        self.reach_base_px = reach_base_px
+        self.reach_px_per_s = reach_px_per_s
+        self.reach_max_px = reach_max_px
         self.acquire_mask = acquire_mask if acquire_mask is not None else acquisition_mask(calib)
         self._seg: list[tuple[float, np.ndarray]] = []
         self._pending: list[tuple[float, np.ndarray]] = []
@@ -179,47 +230,64 @@ class BallTracker:
         if self.camera is None or len(pts) < self.min_fit:
             return None
         f = fit_ballistic([p[0] for p in pts], [p[1] for p in pts], self.camera.P)
-        return f if f.plausible() else None
+        return f if f.plausible(pts[-1][0]) else None
 
     def _close_segment(self, t_end: float, uv_end: np.ndarray, events: list[BallEvent]) -> None:
-        flight = self._fit(self._seg) if len(self._seg) >= self.min_fit else None
-        mph = flight.horizontal_mph if flight else None
-        if mph is not None:
-            self.last_mph = mph
+        pts = [p for p in self._seg if p[0] <= t_end]
+        flight = self._fit(pts) if len(pts) >= self.min_fit else None
+        if flight is None:
+            return  # no verified arc: not evidence of a hit or bounce (rolling, carried, noise)
+        mph = flight.horizontal_mph
+        if len(pts) >= self.speed_min_points and mph <= self.speed_max_mph:
+            self.last_mph = mph  # only well-observed flights drive the speed card
         # Ending low and falling = bounce (ground point -> exact court position); otherwise a hit.
-        is_bounce = False
-        if flight is not None:
-            z_end = flight.position(t_end)[2]
-            vz_end = flight.v0[2] - G_FT * (t_end - flight.t0)
-            is_bounce = z_end < 1.5 and vz_end < 0
+        z_end = flight.position(t_end)[2]
+        vz_end = flight.v0[2] - G_FT * (t_end - flight.t0)
+        is_bounce = z_end < 1.5 and vz_end < 0
         if is_bounce:
             xy = self.calib.image_to_court([uv_end])[0]
         else:
-            xy = flight.position(t_end)[:2] if flight is not None else None
+            xy = flight.position(t_end)[:2]
         events.append(BallEvent("bounce" if is_bounce else "hit", t_end, uv_end, xy, mph))
+
+    def _reach(self, dt: float) -> float:
+        return min(self.reach_base_px + self.reach_px_per_s * max(dt, 0.0), self.reach_max_px)
+
+    def search_hint(self, t: float) -> tuple[np.ndarray, float] | None:
+        """(where, radius) the ball should be this frame, for a relaxed second detection pass."""
+        if not self._seg:
+            return None
+        if self._flight is not None:
+            return self._predict(t), 3 * self.break_px
+        return self._seg[-1][1], self._reach(t - self._seg[-1][0])
 
     def update(self, t: float, candidates: list[BallCandidate]) -> BallState:
         events: list[BallEvent] = []
-        if self._seg and t - self._seg[-1][0] > self.max_gap_s:
+        max_gap = self.max_coast_s if self._flight is not None else self.max_gap_s
+        if self._seg and t - self._seg[-1][0] > max_gap:
             self._seg, self._pending, self._flight = [], [], None  # lost: ball dead or occluded too long
             self._trail = []
 
         pred = self._predict(t)
-        chosen = None
-        if candidates:
-            if pred is not None:
-                d = [np.linalg.norm(c.uv - pred) for c in candidates]
-                k = int(np.argmin(d))
-                gate = self.gate_px if self._flight is None else max(self.gate_px, 4 * self.break_px)
-                if d[k] <= gate:
-                    chosen = candidates[k].uv
-            if chosen is None and not self._seg:
-                ok = [c for c in candidates if self._acquirable(c.uv)]
-                if ok:
-                    chosen = max(ok, key=lambda c: c.area).uv
+        chosen, off_arc = None, False
+        if candidates and self._seg:
+            last_t, last_uv = (self._pending or self._seg)[-1]
+            d_pred = [np.linalg.norm(c.uv - pred) for c in candidates] if pred is not None else None
+            d_last = [np.linalg.norm(c.uv - last_uv) for c in candidates]
+            if d_pred is not None and min(d_pred) <= self.gate_px:
+                chosen = candidates[int(np.argmin(d_pred))].uv
+                off_arc = self._flight is not None and min(d_pred) > self.break_px
+            elif min(d_last) <= self._reach(t - last_t):
+                # Not where the arc said: after a hit the ball restarts from where it was.
+                chosen = candidates[int(np.argmin(d_last))].uv
+                off_arc = self._flight is not None
+        elif candidates:
+            ok = [c for c in candidates if self._acquirable(c.uv)]
+            if ok:
+                chosen = max(ok, key=lambda c: c.area).uv
 
         if chosen is not None:
-            if self._flight is not None and np.linalg.norm(chosen - pred) > self.break_px:
+            if off_arc:
                 self._pending.append((t, chosen))
                 if len(self._pending) >= 2:
                     # Two points in a row off the arc: the ball changed velocity between the last
@@ -227,26 +295,50 @@ class BallTracker:
                     self._close_segment(self._seg[-1][0], self._seg[-1][1], events)
                     self._seg, self._pending, self._flight = list(self._pending), [], None
             else:
-                if self._pending:  # a single outlier: drop it
-                    self._pending = []
+                self._pending = []  # a single off-arc point was an outlier
                 self._seg.append((t, chosen))
-                fit = self._fit(self._seg)
-                if fit is not None:
-                    self._flight = fit
-                elif self._flight is not None and len(self._seg) >= self.min_fit:
-                    self._flight = None
+                self._refit(events)
             self._trail = (self._trail + [chosen])[-10:]
 
         state = BallState(uv=chosen, trail=list(self._trail), last_mph=self.last_mph, events=events)
         if self._flight is not None:
             state.xyz = self._flight.position(t)
             state.flight_mph = self._flight.horizontal_mph
+            if chosen is None and self.camera is not None:
+                state.predicted_uv = self.camera.project(state.xyz)[0]
         return state
+
+    def _refit(self, events: list[BallEvent]) -> None:
+        fit = self._fit(self._seg)
+        if fit is not None:
+            self._flight = fit
+            return
+        self._flight = None
+        # The segment may span a hit that happened before any arc was established (short flights).
+        # If the most recent points alone make a good arc, split there.
+        if len(self._seg) > self.min_fit:
+            tail = self._seg[-self.min_fit:]
+            fit = self._fit(tail)
+            if fit is not None:
+                head_end = self._seg[-self.min_fit - 1]
+                self._close_segment(head_end[0], head_end[1], events)
+                self._seg, self._flight = list(tail), fit
 
     def _acquirable(self, uv: np.ndarray) -> bool:
         u, v = int(round(uv[0])), int(round(uv[1]))
         h, w = self.acquire_mask.shape
         return 0 <= u < w and 0 <= v < h and self.acquire_mask[v, u] > 0
+
+
+def detect_and_track(detector: BallDetector, tracker: BallTracker, frame: np.ndarray, t: float) -> BallState:
+    """One frame: global detection, a relaxed second look where the track expects the ball, update."""
+    cands = detector(frame)
+    hint = tracker.search_hint(t)
+    if hint is not None and hint[0] is not None:
+        uv, radius = hint
+        if not any(np.linalg.norm(c.uv - uv) <= radius for c in cands):
+            cands = cands + detector.search_near(uv, radius)
+    return tracker.update(t, cands)
 
 
 def detection_roi(calib: Calibration, lift_px: int = 260, pad_px: int = 40) -> tuple[int, int, int, int]:

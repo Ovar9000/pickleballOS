@@ -7,10 +7,15 @@ Architecture, decisions, risks and evaluation plan: **[DESIGN.md](DESIGN.md)**.
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python -m pip install -e ".[dev]"     # Windows; use .venv/bin/python on Linux/macOS
+.venv/Scripts/python -m pip install -e ".[dev,cpu]"  # Windows; use .venv/bin/python on Linux/macOS
 .venv/Scripts/python -m pip install --no-deps rtmlib  # its opencv-contrib dep clashes with opencv-python
 .venv/Scripts/python -m pytest
 ```
+
+**NVIDIA GPU (optional):** use `.[dev,gpu]` instead of `.[dev,cpu]` (uninstall `onnxruntime` first; the
+two builds overwrite each other). CUDA and cuDNN come as pip wheels, so only the NVIDIA driver is
+needed. Then add `--device cuda` to `pbos track`. The CPU path stays the reference; the GPU is an
+optional speed tier.
 
 Sample videos are not in the repo (third-party footage, and raw video never goes in git). Put them
 in the project root or `samples/`.
@@ -95,6 +100,34 @@ the near sideline, with a ~660 px focal length (≈ 88° wide lens); the project
 real one. Dink speeds read 7–20 mph horizontal. CPU cost: 6 ms/frame; the whole pipeline analyses
 at 25.5 fps on CPU. Speeds are estimates (drag is ignored) and haven't been checked against ground
 truth yet.
+
+**Temporal tracking.** The fitted arc predicts where the ball goes next. The track coasts through
+short occlusions (drawn as a thin, dim ring), picks the ball up again after hits, and runs a
+relaxed second detection near the prediction for motion-blurred frames. On a 10 s rally that took
+the track from 20 fragments to one continuous track (detections 228 → 252 of 299 frames). Over the
+whole 80 s sample, ball detection went from 53% to 65% of frames, and 76% of frames are tracked
+(the rest is mostly dead time and the cut-away).
+Known limitation: after a rally ends, a rolling or carried ball still produces some "hit" events.
+Audio paddle-pop fusion and rally segmentation (next) are meant to remove them.
+
+## Compute tiers
+
+```bash
+pbos bench --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json --start 420 --seconds 20
+```
+
+Runs the analysis (no video output) on each available tier: `cuda`, `cpu` (all threads), `cpu4`, `cpu2`
+(thread-capped to stand in for smaller machines). Prints a table and saves `out/bench_<video>.json`.
+
+| Tier | Analysis fps (30 fps video) |
+|---|---|
+| CUDA, RTX 3060 Laptop | **40.1** (real time) |
+| CPU, Ryzen 7 5800H, all threads | 25.3 |
+| CPU, 4 threads | 23.4 |
+| CPU, 2 threads | 18.6 |
+
+Two fixes made the GPU pay off. The detector's built-in NMS is cut out and done on the CPU (it
+took 6 ms on the GPU). Pose runs as one batched call with float32 preprocessing.
 
 ## Status
 

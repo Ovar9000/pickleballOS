@@ -81,12 +81,56 @@ def cmd_track(args) -> int:
     stem = Path(args.video).stem
     out_video = None if args.no_video else (args.out or f"out/{stem}_track.mp4")
     db = args.db or f"out/{stem}.db"
-    cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=args.device)
+    cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=args.device, threads=args.threads)
     summary = run_track(args.video, calib, args.start, args.end, out_video, db, cfg)
     summary_path = Path(db).with_name(f"{stem}_track_summary.json")
     summary_path.write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
     print(f"saved {db}" + (f"\nsaved {out_video}" if out_video else "") + f"\nsaved {summary_path}")
+    return 0
+
+
+# Compute tiers measurable on one machine: (ONNX Runtime device, CPU thread cap).
+TIERS = {"cuda": ("cuda", None), "dml": ("dml", None), "cpu": ("cpu", None), "cpu4": ("cpu", 4), "cpu2": ("cpu", 2)}
+
+
+def cmd_bench(args) -> int:
+    from .pipeline import TrackConfig, run_track
+    from .players import RtmlibDetector
+
+    calib = Calibration.load(args.calib)
+    frame = read_frame(args.video, args.start)
+    default_cv_threads = cv2.getNumThreads()
+    rows = []
+    for tier in args.tiers.split(","):
+        device, threads = TIERS[tier]
+        try:
+            detector = RtmlibDetector(args.mode, device, threads=threads)
+        except Exception as e:  # provider not installed, no GPU, ...
+            print(f"{tier}: unavailable ({e})")
+            continue
+        cv2.setNumThreads(threads or default_cv_threads)  # OpenCV work (ball, render) gets the same cap
+        detector.warmup(frame)
+        cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=device, threads=threads)
+        s = run_track(args.video, calib, args.start, args.start + args.seconds, None, None, cfg,
+                      detector=detector, progress=False)
+        ms = s["ms_per_frame"]
+        rows.append({"tier": tier, "detector": s["detector"], "det_every": args.det_every,
+                     "detect_ms": ms.get("detect"), "pose_ms": ms.get("pose"), "ball_ms": ms.get("ball"),
+                     "analysis_fps": s["analysis_fps"], "video_fps": round(s["fps"], 2),
+                     "realtime": bool(s["analysis_fps"] and s["analysis_fps"] >= s["fps"])})
+    cv2.setNumThreads(default_cv_threads)
+
+    print(f"\n| tier | detect ms | pose ms | ball ms | analysis fps | real time ({rows[0]['video_fps'] if rows else '?'} fps) |")
+    print("|---|---|---|---|---|---|")
+    for r in rows:
+        print(f"| {r['tier']} | {r['detect_ms']} | {r['pose_ms']} | {r['ball_ms']} | {r['analysis_fps']} | "
+              f"{'yes' if r['realtime'] else 'no'} |")
+    out = Path(args.out or f"out/bench_{Path(args.video).stem}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"video": Path(args.video).name, "start": args.start, "seconds": args.seconds,
+                               "rows": rows}, indent=2))
+    print(f"saved {out}")
     return 0
 
 
@@ -126,8 +170,21 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--no-video", action="store_true", help="skip rendering; positions and stats only")
     t.add_argument("--det-every", type=int, default=2, help="run detector + pose every N frames")
     t.add_argument("--mode", default="lightweight", choices=["lightweight", "balanced", "performance"])
-    t.add_argument("--device", default="cpu", help="cpu or cuda (needs onnxruntime-gpu)")
+    t.add_argument("--device", default="cpu", choices=["cpu", "cuda", "dml"],
+                   help="cuda needs onnxruntime-gpu, dml needs onnxruntime-directml")
+    t.add_argument("--threads", type=int, help="cap CPU inference threads")
     t.set_defaults(func=cmd_track)
+
+    b = sub.add_parser("bench", help="measure analysis speed per compute tier (no video output)")
+    b.add_argument("--video", required=True)
+    b.add_argument("--calib", required=True)
+    b.add_argument("--start", type=float, default=0.0)
+    b.add_argument("--seconds", type=float, default=20.0)
+    b.add_argument("--tiers", default="cuda,cpu,cpu4,cpu2", help=f"comma list from {sorted(TIERS)}")
+    b.add_argument("--det-every", type=int, default=2)
+    b.add_argument("--mode", default="lightweight", choices=["lightweight", "balanced", "performance"])
+    b.add_argument("--out")
+    b.set_defaults(func=cmd_bench)
 
     k = sub.add_parser("keypoints", help="list the court keypoint names and their court coordinates")
     k.set_defaults(func=cmd_keypoints)

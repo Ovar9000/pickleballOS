@@ -57,14 +57,18 @@ def draw_tag(img: np.ndarray, box: np.ndarray, label: str, color) -> None:
 BALL = (40, 235, 255)  # optic yellow (BGR)
 
 
-def draw_ball(img: np.ndarray, uv, trail) -> None:
-    """Fading trail of recent detections plus a ring on the current one."""
+def draw_ball(img: np.ndarray, uv, trail, predicted_uv=None) -> None:
+    """Fading trail of recent detections, a ring on the current one, and a thin dim ring where the
+    fitted arc says the ball is while it isn't detected (occluded, blurred)."""
     pts = [np.round(p).astype(int) for p in trail]
     for k in range(1, len(pts)):
         a = k / len(pts)
         cv2.line(img, tuple(pts[k - 1]), tuple(pts[k]), tuple(int(c * a) for c in BALL), 2, cv2.LINE_AA)
     if uv is not None:
         cv2.circle(img, tuple(np.round(uv).astype(int)), 9, BALL, 2, cv2.LINE_AA)
+    elif predicted_uv is not None and np.all(np.abs(predicted_uv) < 1e4):
+        cv2.circle(img, tuple(np.round(predicted_uv).astype(int)), 9, tuple(int(c * 0.6) for c in BALL), 1,
+                   cv2.LINE_AA)
 
 
 def draw_speed_card(img: np.ndarray, mph: float | None, x: int, y: int) -> None:
@@ -139,7 +143,7 @@ def render_frame(frame: np.ndarray, calib: Calibration, players: dict[str, dict]
     H, W = img.shape[:2]
     ball = ball or {}
     if ball:
-        draw_ball(img, ball.get("uv"), ball.get("trail", []))
+        draw_ball(img, ball.get("uv"), ball.get("trail", []), ball.get("predicted_uv"))
     draw_speed_card(img, ball.get("mph"), W - 16 - 250, 170)
     draw_distance_panel(img, distances, 16, H - 160)
     draw_court_map(img, {s: p["xy"] for s, p in players.items()}, W - 16 - 108, H - 16 - 234,

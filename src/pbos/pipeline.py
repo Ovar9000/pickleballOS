@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 from . import court
-from .ball import BallDetector, BallTracker, detection_roi
+from .ball import BallDetector, BallTracker, detect_and_track, detection_roi
 from .calibration import Calibration
 from .camera3d import Camera3D, CameraModelError
 from .camera_motion import CameraMotionMonitor
@@ -31,7 +31,8 @@ from .tracking import CourtTracker, DistanceMeter, Measurement
 class TrackConfig:
     det_every: int = 2  # run detector + pose every N frames; Kalman predicts in between
     mode: str = "lightweight"
-    device: str = "cpu"
+    device: str = "cpu"  # cpu | cuda | dml
+    threads: int | None = None  # cap CPU threads for inference (emulates smaller machines)
     side_margin_ft: float = 4.0  # people further outside the court than this are ignored
     end_margin_ft: float = 10.0
     camera_check_s: float = 1.0
@@ -121,7 +122,7 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
     if detector is None:
         from .players import RtmlibDetector
 
-        detector = RtmlibDetector(cfg.mode, cfg.device)
+        detector = RtmlibDetector(cfg.mode, cfg.device, threads=cfg.threads)
 
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
@@ -220,10 +221,12 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
         timings["track"] += time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        bs = ball_tr.update(t, ball_det(frame) if cam_status != "lost" else [])
+        bs = detect_and_track(ball_det, ball_tr, frame, t) if cam_status != "lost" else ball_tr.update(t, [])
         if bs.uv is not None:
             ball_seen = t
             ball_stats["frames_detected"] += 1
+        if bs.uv is not None or bs.predicted_uv is not None:
+            ball_stats["frames_tracked"] += 1  # detected, or coasting on a fitted arc
         if bs.xyz is not None:
             ball_stats["frames_3d"] += 1
         for e in bs.events:
@@ -244,9 +247,10 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
             t0 = time.perf_counter()
             fresh = t - ball_seen < 0.1
             ball_view = {
-                "uv": bs.uv, "trail": bs.trail if t - ball_seen < 0.3 else [],
-                # Ground track from the 3D arc, only while the ball is actually being seen.
-                "xy": bs.xyz[:2] if bs.xyz is not None and fresh and -0.5 < bs.xyz[2] < 30 else None,
+                "uv": bs.uv, "predicted_uv": bs.predicted_uv, "trail": bs.trail if t - ball_seen < 0.3 else [],
+                # Ground track from the 3D arc while the ball is seen or briefly coasting on its arc.
+                "xy": bs.xyz[:2] if bs.xyz is not None and (fresh or bs.predicted_uv is not None)
+                and -0.5 < bs.xyz[2] < 30 else None,
                 "mph": bs.last_mph,
                 "bounces": [(xy, 1 - (t - tb) / 3.0) for tb, xy in bounces if 0 <= t - tb < 3.0],
             }
@@ -276,6 +280,7 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
         "ground_point_cues": dict(cues),
         "ball": {**dict(ball_stats),
                  "detected_share": round(ball_stats["frames_detected"] / max(done, 1), 3),
+                 "tracked_share": round(ball_stats["frames_tracked"] / max(done, 1), 3),
                  "fitted_3d_share": round(ball_stats["frames_3d"] / max(done, 1), 3),
                  "camera_focal_px": round(camera3d.focal_px, 1) if camera3d else None,
                  "camera_position_ft": [round(v, 1) for v in camera3d.center] if camera3d else None},
