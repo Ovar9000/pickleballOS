@@ -36,6 +36,7 @@ class TrackConfig:
     device: str = "cpu"  # cpu | cuda | dml
     threads: int | None = None  # cap CPU threads for inference (emulates smaller machines)
     ball_model: str | None = None  # learned ball detector ONNX; None = classical detector
+    ball_threshold: float = 0.7  # learned detector: heatmap peak needed to report a candidate
     side_margin_ft: float = 4.0  # people further outside the court than this are ignored
     end_margin_ft: float = 10.0
     camera_check_s: float = 1.0
@@ -153,7 +154,8 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
     camera_events = []
     active_calib = calib
     camera3d = camera_or_none(calib)
-    ball_det = LearnedBallDetector(cfg.ball_model, cfg.device) if cfg.ball_model else BallDetector()
+    ball_det = (LearnedBallDetector(cfg.ball_model, cfg.device, threshold=cfg.ball_threshold) if cfg.ball_model
+                else BallDetector())
     ball_det.set_roi(detection_roi(calib))
     ball_tr = BallTracker(calib, camera3d)
     ball_shift = 0.0  # camera shift the ball geometry was last rebuilt for

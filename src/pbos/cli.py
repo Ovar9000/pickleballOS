@@ -82,7 +82,7 @@ def cmd_track(args) -> int:
     out_video = None if args.no_video else (args.out or f"out/{stem}_track.mp4")
     db = args.db or f"out/{stem}.db"
     cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=args.device, threads=args.threads,
-                      ball_model=args.ball_model)
+                      ball_model=args.ball_model, ball_threshold=args.ball_threshold)
     summary = run_track(args.video, calib, args.start, args.end, out_video, db, cfg)
     summary_path = Path(db).with_name(f"{stem}_track_summary.json")
     summary_path.write_text(json.dumps(summary, indent=2))
@@ -260,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="cuda needs onnxruntime-gpu, dml needs onnxruntime-directml")
     t.add_argument("--threads", type=int, help="cap CPU inference threads")
     t.add_argument("--ball-model", help="learned ball detector ONNX (from pbos ball-train); default classical")
+    t.add_argument("--ball-threshold", type=float, default=0.7, help="learned detector peak threshold")
     t.set_defaults(func=cmd_track)
 
     b = sub.add_parser("bench", help="measure analysis speed per compute tier (no video output)")

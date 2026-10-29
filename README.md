@@ -145,19 +145,33 @@ within 3 px of a fitted 3D arc, which gives 5,474 precise labels on the sample. 
 and trains. The weights are written to `models/`, also git-ignored because they derive from
 third-party footage.
 
-**First result:** trained on CPU with 128 px crops for 10 epochs (about 30 min). Held-out window 380–460 s:
+**Results so far** (held-out window 380–460 s, threshold 0.7):
 
-| | Classical | Learned |
-|---|---|---|
-| Frame-level F1 vs held-out auto-labels | 0.841 | 0.844 (median error 0.7 px) |
-| Ball detected (pipeline) | 69.5% of frames | **78.9%** |
-| On a fitted 3D arc | **44.5%** | 36.2% |
-| Detector cost, RTX 3060 | 5 ms | 33 ms (CPU: ~310 ms) |
+| | Classical | Learned, CPU-trained (128 px crops, 10 epochs, ~30 min) | Learned, GPU-trained (256 px crops, 12 epochs, ~10 min) |
+|---|---|---|---|
+| Precision / recall vs held-out auto-labels | 0.86 / 0.82 | 0.85 / 0.84 | **0.87** / 0.74 |
+| Median error | (label source) | 0.69 px | **0.34 px** |
+| Ball detected (pipeline) | 69.5% of frames | **78.9%** | 63.3% |
+| On a fitted 3D arc (speed, court map) | 44.5% | 36.2% | **55.2%** |
+| Detector cost, RTX 3060 | 5 ms | 33 ms | 31 ms (CPU: ~310 ms) |
 
-So it matches the classical detector where they can be compared and sees the ball more often. It
-doesn't yet produce more usable 3D arcs, and it costs more. That is expected from its training
-data: auto-labels only contain frames the classical tracker already handled, so the model learned
-to copy it. The hard frames (blur, occlusion, slow balls) are exactly what's missing.
+The GPU-trained model gives the most usable output: more of its detections land on physically
+consistent arcs, so more frames get a ball speed and a court-map position. It finds the ball in
+fewer frames, though. Lowering its threshold to 0.5 barely changes that (66.8% detected, 54.8% on
+arcs). Both models learned from auto-labels, which only contain frames the classical tracker
+already handled. The hard frames (blur, occlusion, slow balls) are what's missing, and the
+auto-label precision/recall rows are biased for the same reason.
+
+**Training environment.** Training doesn't need the project's ONNX Runtime environment, just
+PyTorch. If PyTorch with CUDA is already installed in another Python, reuse it instead of
+downloading it again:
+
+```bash
+py -3.13 -m venv --system-site-packages .venv-gpu-train   # sees the system torch
+.venv-gpu-train/Scripts/python -m pip install opencv-python onnx
+.venv-gpu-train/Scripts/python -m pip install --no-deps -e .
+.venv-gpu-train/Scripts/pbos ball-train --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json --out models/ballnet_gpu
+```
 
 Next steps, in order of impact:
 1. **Human labels on hard frames.** `pbos label --video dsrgtsdg.mp4 --out out/ball_dataset/dsrgtsdg_gold.json --calib calib/samples/dsrgtsdg.json`
@@ -165,8 +179,9 @@ Next steps, in order of impact:
    Enter to accept the ring, or `n` if it isn't visible. About 200–300 frames gives an unbiased
    test set (`pbos ball-eval --labels ...gold.json`). More, from the training range, make the next
    model better than its teacher.
-2. GPU training at 256 px crops, once the CUDA PyTorch build is installed.
-3. FP16 inference to bring the 33 ms down.
+2. FP16 inference to bring the ~31 ms down.
+3. Use both detectors: classical candidates for recall and learned ones for precision, letting the
+   tracker's arc check pick between them.
 
 The auto-label F1 for the classical detector is below 1.0 because the frame-level test runs it
 without the tracker (fresh state, strongest blob). It is still a biased comparison; only human

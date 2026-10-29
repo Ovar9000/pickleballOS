@@ -166,8 +166,16 @@ def train(train_labels: list[BallLabel], val_labels: list[BallLabel], frame_dir:
             best = acc
             torch.save(model.state_dict(), out_dir / "ballnet.pt")
     model.load_state_dict(torch.load(out_dir / "ballnet.pt", map_location=dev))
-    export_onnx(model.cpu().eval(), out_dir / "ballnet.onnx")
-    return {"best_val_hit_rate": best, "history": history, "device": dev.type, "crop": crop, "epochs": epochs,
+    export_error = None
+    try:
+        export_onnx(model.cpu().eval(), out_dir / "ballnet.onnx")
+    except Exception as e:  # e.g. the `onnx` package missing in this environment; the checkpoint is safe
+        export_error = f"{type(e).__name__}: {e}"
+        log(f"ONNX export failed ({export_error}). The checkpoint is saved; export later with: "
+            f"python -c \"import torch; from pbos.ballnet import BallNet, export_onnx; m = BallNet(); "
+            f"m.load_state_dict(torch.load('{out_dir / 'ballnet.pt'}', map_location='cpu')); "
+            f"export_onnx(m.eval(), '{out_dir / 'ballnet.onnx'}')\"")
+    return {"export_error": export_error, "best_val_hit_rate": best, "history": history, "device": dev.type, "crop": crop, "epochs": epochs,
             "train_labels": len(train_labels), "val_labels": len(val_labels)}
 
 
