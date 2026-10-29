@@ -102,6 +102,93 @@ class BallDetector:
                            (50, 255, 255), 1, self.max_area, np.array([x0 + a0, y0 + b0], dtype=np.float64))
 
 
+class LearnedBallDetector:
+    """Heatmap ball detector (ballnet.py, exported to ONNX), a drop-in for BallDetector.
+
+    Keeps the last three frames of the ROI, runs the network on (t-2, t-1, t) and returns heatmap
+    peaks as candidates. `search_near` re-reads the last heatmap with a lower threshold where the
+    tracker expects the ball, mirroring the classical detector's relaxed second look.
+    """
+
+    def __init__(self, model_path: str, device: str = "cpu", threshold: float = 0.7,
+                 search_threshold: float = 0.2, max_candidates: int = 5):
+        from .players import ort_session
+
+        self.session = ort_session(str(model_path), device)
+        self.threshold, self.search_threshold, self.max_candidates = threshold, search_threshold, max_candidates
+        self.roi: tuple[int, int, int, int] | None = None
+        self._frames: list[np.ndarray] = []
+        self._heat: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self._frames.clear()
+        self._heat = None
+
+    def set_roi(self, roi: tuple[int, int, int, int] | None) -> None:
+        if roi is not None:  # the network needs sizes divisible by 8
+            x0, y0, x1, y1 = roi
+            roi = (x0, y0, x0 + (x1 - x0) // 8 * 8, y0 + (y1 - y0) // 8 * 8)
+        self.roi = roi
+        self.reset()
+
+    def _offset(self) -> np.ndarray:
+        return np.array(self.roi[:2] if self.roi is not None else (0, 0), dtype=np.float64)
+
+    def _peaks(self, heat: np.ndarray, thr: float, window=None) -> list[BallCandidate]:
+        x0 = y0 = 0
+        if window is not None:
+            x0, y0, x1, y1 = window
+            heat = heat[y0:y1, x0:x1]
+        if heat.size == 0:
+            return []
+        local_max = heat >= cv2.dilate(heat, np.ones((5, 5), np.uint8))
+        ys, xs = np.nonzero(local_max & (heat >= thr))
+        kept: list[int] = []
+        for k in np.argsort(-heat[ys, xs]):  # greedy: drop peaks next to a stronger one (plateaus)
+            if all((xs[k] - xs[j]) ** 2 + (ys[k] - ys[j]) ** 2 > 36 for j in kept):
+                kept.append(k)
+            if len(kept) == self.max_candidates:
+                break
+        off = self._offset() + (x0, y0)
+        out = []
+        for k in kept:
+            # Sub-pixel position: heat-weighted centroid of the 5x5 neighbourhood.
+            a0, b0 = max(xs[k] - 2, 0), max(ys[k] - 2, 0)
+            win = heat[b0:ys[k] + 3, a0:xs[k] + 3]
+            gy, gx = np.mgrid[0:win.shape[0], 0:win.shape[1]]
+            uv = np.array([(gx * win).sum(), (gy * win).sum()]) / max(float(win.sum()), 1e-9) + (a0, b0)
+            # `area` carries the confidence, so acquisition prefers the strongest peak.
+            out.append(BallCandidate(uv + off, float(heat[ys[k], xs[k]]) * 100))
+        return out
+
+    def __call__(self, frame: np.ndarray) -> list[BallCandidate]:
+        if self.roi is None:
+            h, w = frame.shape[:2]
+            self.set_roi((0, 0, w, h))
+        x0, y0, x1, y1 = self.roi
+        crop = frame[y0:y1, x0:x1]
+        if self._frames and self._frames[-1].shape != crop.shape:
+            self._frames.clear()
+        self._frames = (self._frames + [crop])[-3:]
+        if len(self._frames) < 3:
+            return []
+        stacked = np.concatenate(self._frames, axis=2)[None]  # (1, H, W, 9) uint8
+        name = self.session.get_inputs()[0].name
+        if name == "frames":  # older export: float NCHW input
+            stacked = np.ascontiguousarray(stacked.transpose(0, 3, 1, 2), dtype=np.float32) / 255.0
+        self._heat = self.session.run(None, {name: stacked})[0][0, 0]
+        return self._peaks(self._heat, self.threshold)
+
+    def search_near(self, uv: np.ndarray, radius: float) -> list[BallCandidate]:
+        if self._heat is None:
+            return []
+        cx, cy = uv - self._offset()
+        r = int(radius)
+        h, w = self._heat.shape
+        window = (max(int(cx) - r, 0), max(int(cy) - r, 0), min(int(cx) + r, w), min(int(cy) + r, h))
+        return self._peaks(self._heat, self.search_threshold, window)
+
+
 @dataclass
 class Flight:
     t0: float

@@ -81,7 +81,8 @@ def cmd_track(args) -> int:
     stem = Path(args.video).stem
     out_video = None if args.no_video else (args.out or f"out/{stem}_track.mp4")
     db = args.db or f"out/{stem}.db"
-    cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=args.device, threads=args.threads)
+    cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=args.device, threads=args.threads,
+                      ball_model=args.ball_model)
     summary = run_track(args.video, calib, args.start, args.end, out_video, db, cfg)
     summary_path = Path(db).with_name(f"{stem}_track_summary.json")
     summary_path.write_text(json.dumps(summary, indent=2))
@@ -111,7 +112,8 @@ def cmd_bench(args) -> int:
             continue
         cv2.setNumThreads(threads or default_cv_threads)  # OpenCV work (ball, render) gets the same cap
         detector.warmup(frame)
-        cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=device, threads=threads)
+        cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=device, threads=threads,
+                          ball_model=args.ball_model)
         s = run_track(args.video, calib, args.start, args.start + args.seconds, None, None, cfg,
                       detector=detector, progress=False)
         ms = s["ms_per_frame"]
@@ -131,6 +133,90 @@ def cmd_bench(args) -> int:
     out.write_text(json.dumps({"video": Path(args.video).name, "start": args.start, "seconds": args.seconds,
                                "rows": rows}, indent=2))
     print(f"saved {out}")
+    return 0
+
+
+def _parse_ranges(text: str) -> list[tuple[float, float]]:
+    return [tuple(float(x) for x in part.split("-")) for part in text.split(",") if part]
+
+
+def _ball_detector_factory(kind: str, calib: Calibration, model: str | None, device: str):
+    """A function returning a reset detector, reusing one instance (ONNX sessions are slow to build)."""
+    from .ball import BallDetector, LearnedBallDetector, detection_roi
+
+    det = LearnedBallDetector(model, device) if kind == "learned" else BallDetector()
+    roi = detection_roi(calib)
+
+    def make():
+        det.set_roi(roi)
+        return det
+    return make
+
+
+def cmd_ball_train(args) -> int:
+    from .balldata import autolabel, cache_frames, load_labels, save_labels, triplet_frames
+
+    stem = Path(args.video).stem
+    labels_path = Path(args.labels or f"out/ball_dataset/{stem}_auto.json")
+    if not labels_path.exists():
+        calib = Calibration.load(args.calib)
+        fps, labels = autolabel(args.video, calib, _parse_ranges(args.ranges))
+        save_labels(labels_path, args.video, fps, labels, {"ranges": args.ranges})
+    meta, labels = load_labels(labels_path)
+    fps = meta["fps"]
+    (v0, v1), = _parse_ranges(args.val)
+    gap = 2.0  # seconds kept out on both sides of the validation window: neighbouring frames look alike
+    val = [lb for lb in labels if v0 <= lb.frame / fps < v1][:: args.stride]
+    train = [lb for lb in labels if not (v0 - gap <= lb.frame / fps < v1 + gap)][:: args.stride]
+    print(f"{len(labels)} auto labels -> train {len(train)}, val {len(val)} (every {args.stride}th)")
+    frame_dir = cache_frames(args.video, triplet_frames(train + val), f"out/ball_dataset/frames_{stem}")
+    from .ballnet import train as train_net
+
+    report = train_net(train, val, frame_dir, args.out, epochs=args.epochs, batch=args.batch, workers=args.workers,
+                       crop=args.crop)
+    report.update({"labels": str(labels_path), "val_window_s": [v0, v1]})
+    Path(args.out, "train_report.json").write_text(json.dumps(report, indent=2))
+    print(json.dumps({k: report[k] for k in ("best_val_hit_rate", "train_labels", "val_labels", "device")}))
+    print(f"saved {Path(args.out, 'ballnet.onnx')}")
+    return 0
+
+
+def cmd_label(args) -> int:
+    from . import label_ui
+
+    cap = cv2.VideoCapture(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    (r0, r1), = _parse_ranges(args.range)
+    frames = label_ui.sample_frames(fps, r0, r1, args.n, args.seed)
+    make = None
+    if args.calib:
+        kind = "learned" if args.ball_model else "classical"
+        make = _ball_detector_factory(kind, Calibration.load(args.calib), args.ball_model, args.device)
+    n = label_ui.run(args.video, args.out, frames, fps, make)
+    print(f"{n} labels in {args.out}")
+    return 0
+
+
+def cmd_ball_eval(args) -> int:
+    from .balldata import load_labels
+    from .balleval import evaluate
+
+    meta, labels = load_labels(args.labels)
+    if args.range:
+        (r0, r1), = _parse_ranges(args.range)
+        labels = [lb for lb in labels if r0 <= lb.frame / meta["fps"] < r1]
+    if args.limit:
+        labels = labels[:: max(1, len(labels) // args.limit)][: args.limit]
+    calib = Calibration.load(args.calib)
+    results = {"labels": args.labels, "source": sorted({lb.source for lb in labels})}
+    results["classical"] = evaluate(args.video, labels, _ball_detector_factory("classical", calib, None, "cpu"))
+    if args.ball_model:
+        results["learned"] = evaluate(args.video, labels,
+                                      _ball_detector_factory("learned", calib, args.ball_model, args.device))
+    print(json.dumps(results, indent=2))
+    if args.out:
+        Path(args.out).write_text(json.dumps(results, indent=2))
     return 0
 
 
@@ -173,6 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--device", default="cpu", choices=["cpu", "cuda", "dml"],
                    help="cuda needs onnxruntime-gpu, dml needs onnxruntime-directml")
     t.add_argument("--threads", type=int, help="cap CPU inference threads")
+    t.add_argument("--ball-model", help="learned ball detector ONNX (from pbos ball-train); default classical")
     t.set_defaults(func=cmd_track)
 
     b = sub.add_parser("bench", help="measure analysis speed per compute tier (no video output)")
@@ -183,8 +270,45 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--tiers", default="cuda,cpu,cpu4,cpu2", help=f"comma list from {sorted(TIERS)}")
     b.add_argument("--det-every", type=int, default=2)
     b.add_argument("--mode", default="lightweight", choices=["lightweight", "balanced", "performance"])
+    b.add_argument("--ball-model", help="benchmark with the learned ball detector")
     b.add_argument("--out")
     b.set_defaults(func=cmd_bench)
+
+    bt = sub.add_parser("ball-train", help="auto-label the ball with the classical tracker and train the learned detector")
+    bt.add_argument("--video", required=True)
+    bt.add_argument("--calib", required=True)
+    bt.add_argument("--ranges", default="20-460,480-699", help="seconds to auto-label, e.g. 20-460,480-699")
+    bt.add_argument("--val", default="380-460", help="validation window in seconds (kept out of training)")
+    bt.add_argument("--labels", help="existing labels JSON (skips auto-labelling)")
+    bt.add_argument("--stride", type=int, default=1, help="use every Nth label")
+    bt.add_argument("--epochs", type=int, default=12)
+    bt.add_argument("--batch", type=int, default=32)
+    bt.add_argument("--workers", type=int, default=4)
+    bt.add_argument("--crop", type=int, default=256, help="training crop size in px (multiple of 8)")
+    bt.add_argument("--out", default="models/ballnet")
+    bt.set_defaults(func=cmd_ball_train)
+
+    lb = sub.add_parser("label", help="click the ball (or mark it hidden) on random frames: ground truth")
+    lb.add_argument("--video", required=True)
+    lb.add_argument("--out", required=True, help="labels JSON (created or resumed)")
+    lb.add_argument("--range", default="380-460", help="seconds to sample from, e.g. 380-460")
+    lb.add_argument("--n", type=int, default=200)
+    lb.add_argument("--seed", type=int, default=0)
+    lb.add_argument("--calib", help="show a detector suggestion ring (needs the calibration)")
+    lb.add_argument("--ball-model", help="suggest with the learned detector instead of the classical one")
+    lb.add_argument("--device", default="cpu", choices=["cpu", "cuda", "dml"])
+    lb.set_defaults(func=cmd_label)
+
+    be = sub.add_parser("ball-eval", help="precision/recall of ball detectors against labels")
+    be.add_argument("--video", required=True)
+    be.add_argument("--calib", required=True)
+    be.add_argument("--labels", required=True)
+    be.add_argument("--ball-model")
+    be.add_argument("--device", default="cpu", choices=["cpu", "cuda", "dml"])
+    be.add_argument("--limit", type=int, help="evaluate an evenly spaced subset of this size")
+    be.add_argument("--range", help="only labels in this time window, e.g. 380-460 (the held-out window)")
+    be.add_argument("--out")
+    be.set_defaults(func=cmd_ball_eval)
 
     k = sub.add_parser("keypoints", help="list the court keypoint names and their court coordinates")
     k.set_defaults(func=cmd_keypoints)

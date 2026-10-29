@@ -15,9 +15,12 @@
 out/
 
 # Python
-.venv/
+.venv*/
 __pycache__/
 *.egg-info/
 .pytest_cache/
 build/
 dist/
+
+# Trained models (derived from local, third-party sample footage)
+models/

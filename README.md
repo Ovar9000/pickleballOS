@@ -126,6 +126,52 @@ On the sample (420–500 s): 241 audio onsets → 60 hits and 10 bounces in 5 ra
 vision alone had logged 85 "hits". One 17 s dink rally was checked frame by frame and is real. Exact
 hit precision and recall still need labelled events.
 
+## Learned ball detector (experimental)
+
+A small U-Net (0.48M parameters, our own code; the idea comes from TrackNet) looks at frames t-2,
+t-1 and t at full resolution and outputs a heatmap of where the ball is at t. Its peaks feed the
+same tracker, so the arcs, coasting and fusion all still apply.
+
+```bash
+# needs PyTorch: CUDA build for GPU training, or the CPU build (slower)
+pbos ball-train --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json            # -> models/ballnet/ballnet.onnx
+pbos track --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json --start 380 --end 460 \
+    --device cuda --ball-model models/ballnet/ballnet.onnx
+```
+
+`ball-train` first **auto-labels** the video with the classical tracker. It keeps only detections
+within 3 px of a fitted 3D arc, which gives 5,474 precise labels on the sample. It holds out
+380–460 s for validation, caches the frames it needs (`out/ball_dataset/`, about 1.9 GB, git-ignored)
+and trains. The weights are written to `models/`, also git-ignored because they derive from
+third-party footage.
+
+**First result:** trained on CPU with 128 px crops for 10 epochs (about 30 min). Held-out window 380–460 s:
+
+| | Classical | Learned |
+|---|---|---|
+| Frame-level F1 vs held-out auto-labels | 0.841 | 0.844 (median error 0.7 px) |
+| Ball detected (pipeline) | 69.5% of frames | **78.9%** |
+| On a fitted 3D arc | **44.5%** | 36.2% |
+| Detector cost, RTX 3060 | 5 ms | 33 ms (CPU: ~310 ms) |
+
+So it matches the classical detector where they can be compared and sees the ball more often. It
+doesn't yet produce more usable 3D arcs, and it costs more. That is expected from its training
+data: auto-labels only contain frames the classical tracker already handled, so the model learned
+to copy it. The hard frames (blur, occlusion, slow balls) are exactly what's missing.
+
+Next steps, in order of impact:
+1. **Human labels on hard frames.** `pbos label --video dsrgtsdg.mp4 --out out/ball_dataset/dsrgtsdg_gold.json --calib calib/samples/dsrgtsdg.json`
+   shows random frames from the held-out window with a suggestion ring. Click the ball, press
+   Enter to accept the ring, or `n` if it isn't visible. About 200–300 frames gives an unbiased
+   test set (`pbos ball-eval --labels ...gold.json`). More, from the training range, make the next
+   model better than its teacher.
+2. GPU training at 256 px crops, once the CUDA PyTorch build is installed.
+3. FP16 inference to bring the 33 ms down.
+
+The auto-label F1 for the classical detector is below 1.0 because the frame-level test runs it
+without the tracker (fresh state, strongest blob). It is still a biased comparison; only human
+labels settle it.
+
 ## Compute tiers
 
 ```bash
@@ -153,6 +199,6 @@ took 6 ms on the GPU). Pose runs as one batched call with float32 preprocessing.
 | 2 | Calibration tool + leave-one-out accuracy | done |
 | 3 | Player tracking → positions → distance, court map, camera-move check | done |
 | 4 | Ball tracking, 3D arcs, bounces, speed, audio contacts, rallies | done (classical ball detector) |
-| next | Learned ball detector (TrackNet-style), trained on auto-labelled sample footage | proposed |
+| 4b | Learned ball detector: auto-labels, training, ONNX, labelling and eval tools | first model trained; needs human labels to beat the classical detector |
 
 License: [MIT](LICENSE).

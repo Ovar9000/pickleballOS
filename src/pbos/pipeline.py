@@ -18,7 +18,7 @@ import numpy as np
 
 from . import court
 from .audio import OnsetDetector, load_audio
-from .ball import BallDetector, BallTracker, detect_and_track, detection_roi
+from .ball import BallDetector, BallTracker, LearnedBallDetector, detect_and_track, detection_roi
 from .calibration import Calibration
 from .camera3d import Camera3D, CameraModelError
 from .camera_motion import CameraMotionMonitor
@@ -35,6 +35,7 @@ class TrackConfig:
     mode: str = "lightweight"
     device: str = "cpu"  # cpu | cuda | dml
     threads: int | None = None  # cap CPU threads for inference (emulates smaller machines)
+    ball_model: str | None = None  # learned ball detector ONNX; None = classical detector
     side_margin_ft: float = 4.0  # people further outside the court than this are ignored
     end_margin_ft: float = 10.0
     camera_check_s: float = 1.0
@@ -152,7 +153,7 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
     camera_events = []
     active_calib = calib
     camera3d = camera_or_none(calib)
-    ball_det = BallDetector()
+    ball_det = LearnedBallDetector(cfg.ball_model, cfg.device) if cfg.ball_model else BallDetector()
     ball_det.set_roi(detection_roi(calib))
     ball_tr = BallTracker(calib, camera3d)
     ball_shift = 0.0  # camera shift the ball geometry was last rebuilt for
@@ -315,6 +316,7 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
     return {
         "video": Path(video).name, "start": start, "end": round(start + done / fps, 2), "frames": done, "fps": fps,
         "detector": detector.name, "det_every": cfg.det_every,
+        "ball_detector": Path(cfg.ball_model).name if cfg.ball_model else "classical",
         "distance_ft_est": {s: round(m.total_ft, 1) for s, m in sorted(meters.items())},
         "distance_rejected_jumps": {s: m.rejected_jumps for s, m in sorted(meters.items())},
         "ground_point_cues": dict(cues),
