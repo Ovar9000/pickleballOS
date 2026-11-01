@@ -45,7 +45,7 @@ class Contact:
     slot: str | None = None
     court_xy: np.ndarray | None = None
     uv: np.ndarray | None = None
-    speed_mph: float | None = None
+    speed_kmh: float | None = None
 
 
 @dataclass
@@ -126,10 +126,10 @@ class ContactFusion:
             when = onset.t if onset else e.t
             if near and (onset is not None or (e.kind == "hit" and not self.require_audio)):
                 out.append(Contact(when, "hit", "audio+vision" if onset else "vision", slot,
-                                   players[slot].court_xy if slot else None, e.uv, e.speed_mph))
+                                   players[slot].court_xy if slot else None, e.uv, e.speed_kmh))
             elif not near and e.kind == "bounce":
                 out.append(Contact(when, "bounce", "audio+vision" if onset else "vision", None, e.court_xy, e.uv,
-                                   e.speed_mph))
+                                   e.speed_kmh))
             else:
                 if k is not None:
                     used.discard(k)  # the pop may still explain a hidden contact below

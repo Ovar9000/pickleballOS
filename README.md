@@ -73,7 +73,7 @@ plus an ORB check each second) re-aligns the calibration when the camera is re-a
 tracking during cut-aways. Models download to `~/.cache/rtmlib` on first run.
 
 Outputs in `out/` (git-ignored): `<video>_track.mp4` (overlay with source audio), `<video>.db`
-(SQLite: session, 10 Hz positions, camera events) and `<video>_track_summary.json` (distances,
+(SQLite: session, 10 Hz positions, camera events) and `<video>_track_summary.json` (distances in metres,
 camera events, ms per stage, FPS).
 
 Measured on the sample (420–500 s, CPU only, Ryzen 7 5800H, 1280×720, detector every 2nd frame):
@@ -86,6 +86,36 @@ are off by several feet (far players show up beyond the far baseline). Re-click 
 both halves, e.g. `pbos calibrate --video dsrgtsdg.mp4 --at 492 --out calib/dsrgtsdg_492.json`, and
 run tracking from 480 s.
 
+### Checking player positions (human labels)
+
+Is a player really where the map puts them? Label random frames, then score the map against them:
+
+```bash
+.venv/Scripts/pbos player-label --video dsrgtsdg.mp4 --range 380-460 --n 100 --out out/player_dataset/dsrgtsdg_players.json
+.venv/Scripts/pbos player-eval --video dsrgtsdg.mp4 --calib calib/samples/dsrgtsdg.json     --labels out/player_dataset/dsrgtsdg_players.json --device cuda
+```
+
+For every player of this court (not other courts or spectators), click the floor **midway between
+their feet**. **Left-click** if that point is inside the painted lines (on a line counts as in),
+**right-click** if it is outside. **Shift+click** when the feet are hidden (net post, another player):
+it is a best guess, counted for "was the player found" but not for position error. **u** undoes the last
+point, **Enter** finishes the frame, **s** skips a cut-away or unclear frame, **b** goes back, **q** quits.
+Answers are saved after every frame and a rerun resumes; `--review` walks the labelled frames again.
+About 100 frames take 15–20 minutes.
+
+`player-eval` runs the real pipeline over the labelled window and reports:
+
+- **found / recall** and **extra tracks**: players the map missed or invented;
+- **position error** in feet (median and 90th percentile, near and far half): map position against the
+  clicked point mapped through the same calibration, so this measures the ground point and tracker,
+  *not* the calibration;
+- **in/out agreement**: your in/out calls come from the painted lines, so they do catch calibration
+  errors. *Calibration agrees* checks the clicked point through the calibration alone; *map agrees*
+  checks the map position. Every disagreement is listed with its time.
+
+Labels are image pixels, so the same labels score any later calibration (e.g. one re-clicked with
+far-court points) or ground-point change.
+
 ## Phase 4 (part 1) — ball, bounces, speed
 
 Runs inside `pbos track`. The ball is found with classical vision (moving + optic-yellow + ball-sized
@@ -97,7 +127,7 @@ exactly through the homography at touchdown and logged with the hits in the `eve
 On the sample (420–500 s, including dead time and a 10 s cut-away): ball found in 53% of frames,
 3D arc in 41%, 16 bounces and 24 hits logged. The recovered camera is about 5 ft high, 7 ft outside
 the near sideline, with a ~660 px focal length (≈ 88° wide lens); the projected net tape lands on the
-real one. Dink speeds read 7–20 mph horizontal. CPU cost: 6 ms/frame; the whole pipeline analyses
+real one. Dink speeds read 11–32 km/h horizontal. CPU cost: 6 ms/frame; the whole pipeline analyses
 at 25.5 fps on CPU. Speeds are estimates (drag is ignored) and haven't been checked against ground
 truth yet.
 
@@ -107,6 +137,33 @@ relaxed second detection near the prediction for motion-blurred frames. On a 10 
 the track from 20 fragments to one continuous track (detections 228 → 252 of 299 frames). Over the
 whole 80 s sample, ball detection went from 53% to 65% of frames, and 76% of frames are tracked
 (the rest is mostly dead time and the cut-away).
+
+**Locking onto the right ball.** Scored as a whole (detector + tracker, frames played in order) on the
+216 hand-labelled frames, the tracker used to do *worse* than the bare detector: F1 0.46 against
+0.70. It latched onto blobs that are not the ball in play (shoes, shirts, balls on the next court)
+and never let go, and it coasted short arcs far off-screen. Three changes fix that:
+
+- candidates the main track doesn't take feed side tracks, and the tracker switches to one whose
+  points fit a ballistic arc when the main track has no arc or has lost the ball;
+- a main track with 8 points and still no arc is retired; it keeps absorbing its blob, so the blob
+  isn't picked up again;
+- coasting on an arc lasts at most as long as the arc was observed (0.15–0.5 s) and stops when the
+  prediction leaves the picture.
+
+| Classical detector, 380–460 s, human labels | Precision | Recall | F1 |
+|---|---|---|---|
+| Detector alone (strongest blob, 5 px) | 0.73 | 0.67 | 0.70 |
+| Tracker before (8 px) | 0.47 | 0.46 | 0.46 |
+| **Tracker now** (8 px) | **0.76** | **0.73** | **0.74** |
+
+Most of the remaining misses are frames where the detector has no candidate on the ball at all.
+Reproduce with `pbos ball-eval ... --tracking`. Ball cost stays ~5 ms/frame.
+
+**Court map.** Top-down, camera side at the bottom, with the kitchens shaded and 3–5 ft of run-off
+around the court. Players are slot-coloured dots with their last 2 s of movement; the ball's ground
+track (from the 3D arc) is a yellow dot that grows with height, with its recent path; bounces are
+fading rings. Ball speed is shown in km/h and distance covered in metres (court geometry stays in
+feet internally, since the court is specified in feet).
 ## Phase 4 (part 2) — audio contacts, fusion, rallies
 
 Also inside `pbos track`. The soundtrack is scanned for paddle pops: sharp 1.5–6 kHz bursts at

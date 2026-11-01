@@ -48,12 +48,12 @@ def simulate(cam, p0, v0, seconds, t0=0.0, noise=0.0, seed=0):
 
 def test_ballistic_fit_recovers_3d_flight_from_one_view():
     cam = true_camera()
-    p0, v0 = (12.0, 6.0, 3.0), (-2.0, 35.0, 9.0)  # a drive from the near baseline, ~24 mph
+    p0, v0 = (12.0, 6.0, 3.0), (-2.0, 35.0, 9.0)  # a drive from the near baseline, ~39 km/h
     ts, uv = simulate(cam, p0, v0, 0.8, noise=0.7)
     fit = fit_ballistic(ts, uv, cam.P)
     assert fit.rms_px < 1.5
     np.testing.assert_allclose(fit.p0, p0, atol=1.0)
-    assert abs(fit.horizontal_mph - np.hypot(*v0[:2]) * 3600 / 5280) < 2.0
+    assert abs(fit.horizontal_kmh - np.hypot(*v0[:2]) * 0.3048 * 3.6) < 3.0
 
 
 def test_tracker_splits_flights_and_places_the_bounce():
@@ -79,7 +79,7 @@ def test_tracker_splits_flights_and_places_the_bounce():
     assert abs(bounces[0].t - t_land) < 2.5 / FPS
     # Bounce position from the last pre-bounce frame: within the distance travelled in a frame.
     assert np.linalg.norm(bounces[0].court_xy - land[:2]) < 2.0
-    assert abs(bounces[0].speed_mph - np.hypot(*v0[:2]) * 3600 / 5280) < 2.0
+    assert abs(bounces[0].speed_kmh - np.hypot(*v0[:2]) * 0.3048 * 3.6) < 3.0
 
 
 def test_track_survives_a_hit_and_a_short_occlusion():
@@ -137,3 +137,27 @@ def test_detector_finds_a_moving_yellow_ball_not_a_static_one():
         found = det(f)
     assert len(found) == 1
     np.testing.assert_allclose(found[0].uv, (490, 300), atol=1.0)
+
+
+def test_tracker_leaves_a_blob_without_an_arc_for_the_ball():
+    # A yellow shoe shuffles on the spot from the start; half a second later the real ball flies
+    # across the court, well out of the shoe track's reach. The tracker must switch to the ball once
+    # its arc is confirmed, and coast no longer than the arc was observed after the ball vanishes.
+    truth = true_camera()
+    calib = calib_from(truth)
+    cam = Camera3D.from_calibration(calib)
+    ball = Flight(0.5, np.array([4.0, 30.0, 3.0]), np.array([4.0, -20.0, 8.0]), 0.0)
+    shoe = truth.project([[15.0, 8.0, 0.0]])[0]
+    tracker = BallTracker(calib, cam, acquire_mask=np.full((H, W), 255, np.uint8))
+    on_ball = coasting = 0
+    for k in range(int(1.3 * FPS)):
+        t = k / FPS
+        cands = [BallCandidate(shoe + (8 * np.sin(3 * k), 3 * np.cos(5 * k)), 30.0)]
+        if 0.5 <= t < 1.0:
+            cands.append(BallCandidate(truth.project(ball.position(t))[0], 10.0))
+        st = tracker.update(t, cands)
+        if 0.5 + 6 / FPS <= t < 1.0:
+            on_ball += st.uv is not None and np.linalg.norm(st.uv - truth.project(ball.position(t))[0]) < 1.0
+        coasting += t >= 1.0 and st.predicted_uv is not None
+    assert on_ball == len([k for k in range(int(1.3 * FPS)) if 0.5 + 6 / FPS <= k / FPS < 1.0])
+    assert 0 < coasting <= 0.5 * FPS + 1

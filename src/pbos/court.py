@@ -13,6 +13,7 @@ KITCHEN_DEPTH_FT = 7.0
 NEAR_KITCHEN_Y = NET_Y - KITCHEN_DEPTH_FT
 FAR_KITCHEN_Y = NET_Y + KITCHEN_DEPTH_FT
 CENTER_X = WIDTH_FT / 2
+FT_TO_M = 0.3048  # geometry stays in feet (the court is specified in feet); shown to users in metres
 
 # The twelve painted line intersections, in the order the calibration tool asks for them.
 KEYPOINTS: dict[str, tuple[float, float]] = {

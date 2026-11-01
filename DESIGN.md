@@ -211,7 +211,7 @@ CREATE TABLE shots (            -- derived, rebuildable from events
   id INTEGER PRIMARY KEY, rally_id INTEGER REFERENCES rallies(id), shot_no INTEGER,
   hitter_slot TEXT, contact_event INTEGER, bounce_event INTEGER,
   shot_type TEXT,               -- serve | return | third_drop | third_drive | dink | speedup | volley | lob | other
-  speed_mph_est REAL, depth_ft REAL, result TEXT
+  speed_kmh_est REAL, depth_ft REAL, result TEXT
 );
 
 CREATE TABLE rally_features (   -- training rows for the performance score

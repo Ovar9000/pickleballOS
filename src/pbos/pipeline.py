@@ -121,7 +121,9 @@ def camera_or_none(calib: Calibration) -> Camera3D | None:
 
 def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | None = None,
               out_video: str | None = None, db_path: str | None = None, cfg: TrackConfig | None = None,
-              detector: PlayerDetector | None = None, progress: bool = True) -> dict:
+              detector: PlayerDetector | None = None, progress: bool = True, frame_hook=None) -> dict:
+    """frame_hook(frame_index, t, players, calib), if given, sees every frame's player tracks and the
+    calibration in force (re-aligned after camera moves); evaluation uses it to score what the map shows."""
     cfg = cfg or TrackConfig()
     if detector is None:
         from .players import RtmlibDetector
@@ -135,6 +137,7 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
     total = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
     end = min(end if end is not None else total, total)
     cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+    first_frame = int(round(cap.get(cv2.CAP_PROP_POS_FRAMES)))
     n_frames = int((end - start) * fps)
 
     log = EventLog(db_path) if db_path else None
@@ -161,6 +164,8 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
     ball_shift = 0.0  # camera shift the ball geometry was last rebuilt for
     ball_seen = -1e9
     bounces: list[tuple[float, np.ndarray]] = []
+    ball_path: list[tuple[float, np.ndarray]] = []  # recent ground track, for the court map
+    player_paths: dict[str, list[tuple[float, np.ndarray]]] = defaultdict(list)
     ball_stats: Counter = Counter()
     try:
         onsets = OnsetDetector().detect(load_audio(video, start, end), start)
@@ -225,12 +230,15 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
         for slot, tr in players.items():
             if slot_track.get(slot) != tr.id:
                 meters[slot].restart()  # a different track now holds this slot: no distance across the gap
+                player_paths[slot] = []
                 slot_track[slot] = tr.id
             if tr.last_update == t:  # measured this frame; predictions alone never add distance
                 meters[slot].add(tr.xy, t)
         if log and i % log_every == 0:
             for slot, tr in players.items():
                 log.add_position(sid, t, slot, float(tr.xy[0]), float(tr.xy[1]))
+        if frame_hook is not None:
+            frame_hook(first_frame + i, t, players, active_calib if cam_status != "lost" else None)
         timings["track"] += time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -246,7 +254,7 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
             ball_stats["direction_changes"] += 1
             if log:
                 log.add_event(sid, e.t, "ball_break", court_xy=e.court_xy, img_uv=e.uv, source="vision",
-                              extra={"vision_kind": e.kind, "speed_mph_est": e.speed_mph})
+                              extra={"vision_kind": e.kind, "speed_kmh_est": e.speed_kmh})
         timings["ball"] += time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -274,7 +282,7 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
             if log:
                 log.add_event(sid, c.t, "contact" if c.kind == "hit" else "bounce", slot=c.slot,
                               court_xy=c.court_xy, img_uv=c.uv, source=c.source,
-                              extra={"speed_mph_est": c.speed_mph})
+                              extra={"speed_kmh_est": c.speed_kmh})
         closed = rallies.step(t)
         if closed and log:
             log.add_rally(sid, closed.start, closed.end, closed.hits, closed.bounces)
@@ -283,12 +291,22 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
         if sink:
             t0 = time.perf_counter()
             fresh = t - ball_seen < 0.1
+            # Ground track from the 3D arc while the ball is seen or briefly coasting on its arc.
+            on_map = bs.xyz is not None and (fresh or bs.predicted_uv is not None) and -0.5 < bs.xyz[2] < 30
+            if on_map:
+                if ball_path and np.linalg.norm(bs.xyz[:2] - ball_path[-1][1]) > 4.0:
+                    ball_path = []  # a new arc somewhere else (~4 ft/frame is faster than any shot)
+                ball_path = [b for b in ball_path if t - b[0] < 0.6] + [(t, bs.xyz[:2].copy())]
+            elif ball_path and t - ball_path[-1][0] > 0.15:
+                ball_path = []
+            for slot, tr in players.items():
+                player_paths[slot] = [q for q in player_paths[slot] if t - q[0] < 2.0] + [(t, tr.xy.copy())]
             ball_view = {
                 "uv": bs.uv, "predicted_uv": bs.predicted_uv, "trail": bs.trail if t - ball_seen < 0.3 else [],
-                # Ground track from the 3D arc while the ball is seen or briefly coasting on its arc.
-                "xy": bs.xyz[:2] if bs.xyz is not None and (fresh or bs.predicted_uv is not None)
-                and -0.5 < bs.xyz[2] < 30 else None,
-                "mph": bs.last_mph,
+                "xy": bs.xyz[:2] if on_map else None,
+                "z": float(bs.xyz[2]) if on_map else None,
+                "map_trail": [xy for _, xy in ball_path],
+                "kmh": bs.last_kmh,
                 "bounces": [(xy, 1 - (t - tb) / 3.0) for tb, xy in bounces if 0 <= t - tb < 3.0],
             }
             if rallies.current is not None:
@@ -297,8 +315,10 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
                 rally_view = {"hits": rallies.rallies[-1].hits, "live": False}
             else:
                 rally_view = None
-            view = render_frame(frame, active_calib, {s: {"xy": tr.xy, "box": tr.box} for s, tr in players.items()},
-                                {s: m.total_ft for s, m in meters.items()}, cam_status, ball_view, rally_view)
+            player_view = {s: {"xy": tr.xy, "box": tr.box, "trail": [xy for _, xy in player_paths[s]]}
+                           for s, tr in players.items()}
+            view = render_frame(frame, active_calib, player_view,
+                                {s: m.total_ft * court.FT_TO_M for s, m in meters.items()}, cam_status, ball_view, rally_view)
             timings["render"] += time.perf_counter() - t0
             t0 = time.perf_counter()
             sink.write(view)
@@ -319,7 +339,7 @@ def run_track(video: str, calib: Calibration, start: float = 0.0, end: float | N
         "video": Path(video).name, "start": start, "end": round(start + done / fps, 2), "frames": done, "fps": fps,
         "detector": detector.name, "det_every": cfg.det_every,
         "ball_detector": Path(cfg.ball_model).name if cfg.ball_model else "classical",
-        "distance_ft_est": {s: round(m.total_ft, 1) for s, m in sorted(meters.items())},
+        "distance_m_est": {s: round(m.total_ft * court.FT_TO_M, 1) for s, m in sorted(meters.items())},
         "distance_rejected_jumps": {s: m.rejected_jumps for s, m in sorted(meters.items())},
         "ground_point_cues": dict(cues),
         "ball": {**dict(ball_stats),

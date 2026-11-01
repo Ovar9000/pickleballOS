@@ -226,7 +226,7 @@ def cmd_label(args) -> int:
 
 def cmd_ball_eval(args) -> int:
     from .balldata import load_labels
-    from .balleval import evaluate
+    from .balleval import evaluate, evaluate_tracking
 
     meta, labels = load_labels(args.labels)
     if args.range:
@@ -240,6 +240,53 @@ def cmd_ball_eval(args) -> int:
     if args.ball_model:
         results["learned"] = evaluate(args.video, labels,
                                       _ball_detector_factory("learned", calib, args.ball_model, args.device))
+    if args.tracking:
+        results["classical_tracked"] = evaluate_tracking(args.video, labels, calib,
+                                                         _ball_detector_factory("classical", calib, None, "cpu"))
+        if args.ball_model:
+            results["learned_tracked"] = evaluate_tracking(
+                args.video, labels, calib, _ball_detector_factory("learned", calib, args.ball_model, args.device))
+    print(json.dumps(results, indent=2))
+    if args.out:
+        Path(args.out).write_text(json.dumps(results, indent=2))
+    return 0
+
+
+def cmd_player_label(args) -> int:
+    from . import label_ui, player_label_ui
+
+    cap = cv2.VideoCapture(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    if args.review:
+        from .playereval import load_player_labels
+
+        frames = [f.frame for f in load_player_labels(args.out)[1]]
+    else:
+        ranges = _parse_ranges(args.range)
+        per = -(-args.n // len(ranges))
+        frames = sorted(f for r0, r1 in ranges for f in label_ui.sample_frames(fps, r0, r1, per, args.seed))
+    print(f"{len(frames)} frames to label")
+    n = player_label_ui.run(args.video, args.out, frames, fps, review=args.review)
+    print(f"{n} labelled frames in {args.out}")
+    return 0
+
+
+def cmd_player_eval(args) -> int:
+    from .pipeline import TrackConfig, run_track
+    from .playereval import PlayerScorer, load_player_labels
+
+    meta, labels = load_player_labels(args.labels)
+    if not labels:
+        raise ValueError(f"no labelled frames in {args.labels}")
+    fps = meta["fps"]
+    scorer = PlayerScorer(labels, args.max_match_ft)
+    # Start early enough for the tracker to confirm the players before the first labelled frame.
+    start = max(min(f.frame for f in labels) / fps - args.lead, 0.0)
+    end = max(f.frame for f in labels) / fps + 0.1
+    cfg = TrackConfig(det_every=args.det_every, mode=args.mode, device=args.device)
+    run_track(args.video, Calibration.load(args.calib), start, end, cfg=cfg, frame_hook=scorer.hook)
+    results = {"labels": args.labels, "calib": args.calib, **scorer.summary()}
     print(json.dumps(results, indent=2))
     if args.out:
         Path(args.out).write_text(json.dumps(results, indent=2))
@@ -342,8 +389,31 @@ def build_parser() -> argparse.ArgumentParser:
     be.add_argument("--device", default="cpu", choices=["cpu", "cuda", "dml"])
     be.add_argument("--limit", type=int, help="evaluate an evenly spaced subset of this size")
     be.add_argument("--range", help="only labels in this time window, e.g. 380-460 (the held-out window)")
+    be.add_argument("--tracking", action="store_true",
+                    help="also score the full tracker (frames played in order) on the same labels")
     be.add_argument("--out")
     be.set_defaults(func=cmd_ball_eval)
+
+    pl = sub.add_parser("player-label", help="click where each player stands (in/out) on random frames: ground truth")
+    pl.add_argument("--video", required=True)
+    pl.add_argument("--out", required=True, help="labels JSON (created or resumed)")
+    pl.add_argument("--range", default="380-460", help="seconds to sample from, e.g. 380-460 or 20-200,480-699")
+    pl.add_argument("--review", action="store_true", help="walk the frames already in --out to confirm or fix them")
+    pl.add_argument("--n", type=int, default=100)
+    pl.add_argument("--seed", type=int, default=0)
+    pl.set_defaults(func=cmd_player_label)
+
+    pe = sub.add_parser("player-eval", help="score the court map's player positions against labels")
+    pe.add_argument("--video", required=True)
+    pe.add_argument("--calib", required=True, help="calibration to evaluate (labels are pixels, so any calibration works)")
+    pe.add_argument("--labels", required=True)
+    pe.add_argument("--det-every", type=int, default=2)
+    pe.add_argument("--mode", default="lightweight", choices=["lightweight", "balanced", "performance"])
+    pe.add_argument("--device", default="cpu", choices=["cpu", "cuda", "dml"])
+    pe.add_argument("--lead", type=float, default=3.0, help="seconds of tracking before the first labelled frame")
+    pe.add_argument("--max-match-ft", type=float, default=6.0, help="a map position further away counts as a miss")
+    pe.add_argument("--out")
+    pe.set_defaults(func=cmd_player_eval)
 
     k = sub.add_parser("keypoints", help="list the court keypoint names and their court coordinates")
     k.set_defaults(func=cmd_keypoints)

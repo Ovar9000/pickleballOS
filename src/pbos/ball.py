@@ -25,7 +25,7 @@ from .calibration import Calibration
 from .camera3d import Camera3D
 
 G_FT = 32.174  # ft/s^2
-FPS_TO_MPH = 3600 / 5280
+FT_PER_S_TO_KMH = court.FT_TO_M * 3.6
 
 
 @dataclass
@@ -201,13 +201,13 @@ class Flight:
         return self.p0 + self.v0 * tau + np.array([0.0, 0.0, -0.5 * G_FT * tau * tau])
 
     @property
-    def horizontal_mph(self) -> float:
-        return float(np.linalg.norm(self.v0[:2]) * FPS_TO_MPH)
+    def horizontal_kmh(self) -> float:
+        return float(np.linalg.norm(self.v0[:2]) * FT_PER_S_TO_KMH)
 
     def plausible(self, t_end: float | None = None) -> bool:
         """Small residual, sane speed, and the arc stays around the court (and above the floor)
         for the whole time it was observed."""
-        if not (self.rms_px < 4.0 and self.horizontal_mph < 90.0):
+        if not (self.rms_px < 4.0 and self.horizontal_kmh < 145.0):
             return False
         for t in (self.t0, t_end if t_end is not None else self.t0):
             x, y, z = self.position(t)
@@ -250,7 +250,7 @@ class BallEvent:
     t: float
     uv: np.ndarray
     court_xy: np.ndarray | None  # bounce: exact ground point; hit: estimate from the 3D arc, if fitted
-    speed_mph: float | None  # horizontal speed of the flight that ended here, if it was fitted
+    speed_kmh: float | None  # horizontal speed of the flight that ended here, if it was fitted
 
 
 @dataclass
@@ -259,9 +259,17 @@ class BallState:
     predicted_uv: np.ndarray | None = None  # where the fitted arc puts it when not detected (coasting)
     trail: list = field(default_factory=list)
     xyz: np.ndarray | None = None  # 3D estimate (ft) from the current flight fit
-    flight_mph: float | None = None  # current flight, horizontal
-    last_mph: float | None = None  # last completed fitted flight, horizontal
+    flight_kmh: float | None = None  # current flight, horizontal
+    last_kmh: float | None = None  # last completed fitted flight, horizontal
     events: list[BallEvent] = field(default_factory=list)  # emitted this frame
+
+
+@dataclass(eq=False)  # compared by identity
+class _Hypothesis:
+    """A side track kept next to the main one, so the tracker can switch to the real ball."""
+    pts: list = field(default_factory=list)
+    flight: Flight | None = None
+    junk: bool = False  # a retired main track: keeps absorbing its blob so it is not picked up again
 
 
 class BallTracker:
@@ -271,41 +279,57 @@ class BallTracker:
     lets the track coast through short occlusions); after a hit, when the ball leaves the arc, it
     is searched for around its last position in a radius that grows with elapsed time; and
     `search_hint` tells the detector where a relaxed second look is worthwhile.
+
+    Candidates the main track doesn't take feed side hypotheses. A blob that keeps moving without
+    ever fitting a ballistic arc (a shoe, a shirt, a ball on the next court) is not the ball in
+    play, so a main track like that is retired, and the tracker switches to a hypothesis that does
+    fit an arc whenever the main track has none or has lost the ball. Coasting on an arc is limited
+    to about as long as the arc was observed, since a short fit extrapolates badly.
     """
 
     def __init__(self, calib: Calibration, camera: Camera3D | None, min_fit: int = 5, break_px: float = 7.0,
-                 gate_px: float = 45.0, max_gap_s: float = 0.3, max_coast_s: float = 0.5,
+                 gate_px: float = 45.0, max_gap_s: float = 0.3, max_coast_s: float = 0.5, min_coast_s: float = 0.15,
                  reach_base_px: float = 20.0, reach_px_per_s: float = 1500.0, reach_max_px: float = 160.0,
-                 speed_min_points: int = 8, speed_max_mph: float = 70.0,
-                 acquire_mask: np.ndarray | None = None):
+                 speed_min_points: int = 8, speed_max_kmh: float = 110.0, stale_points: int = 8,
+                 max_hypotheses: int = 8, hyp_window: int = 12, acquire_mask: np.ndarray | None = None):
         self.calib = calib
         self.speed_min_points = speed_min_points
-        self.speed_max_mph = speed_max_mph
+        self.speed_max_kmh = speed_max_kmh
         self.camera = camera
         self.min_fit = min_fit
         self.break_px = break_px
         self.gate_px = gate_px
         self.max_gap_s = max_gap_s
         self.max_coast_s = max_coast_s
+        self.min_coast_s = min_coast_s
         self.reach_base_px = reach_base_px
         self.reach_px_per_s = reach_px_per_s
         self.reach_max_px = reach_max_px
+        self.stale_points = stale_points
+        self.max_hypotheses = max_hypotheses
+        self.hyp_window = hyp_window
         self.acquire_mask = acquire_mask if acquire_mask is not None else acquisition_mask(calib)
         self._seg: list[tuple[float, np.ndarray]] = []
         self._pending: list[tuple[float, np.ndarray]] = []
         self._flight: Flight | None = None
         self._trail: list[np.ndarray] = []
-        self.last_mph: float | None = None
+        self._hyps: list[_Hypothesis] = []
+        self.last_kmh: float | None = None
 
     def set_geometry(self, calib: Calibration, camera: Camera3D | None) -> None:
         """New calibration after the camera moved. The current arc is refitted on the next point."""
         self.calib, self.camera = calib, camera
         self.acquire_mask = acquisition_mask(calib)
         self._flight = None
+        for h in self._hyps:
+            h.flight = None
+
+    def _project(self, flight: Flight, t: float) -> np.ndarray:
+        return self.camera.project(flight.position(t))[0]
 
     def _predict(self, t: float) -> np.ndarray | None:
         if self._flight is not None and self.camera is not None:
-            return self.camera.project(self._flight.position(t))[0]
+            return self._project(self._flight, t)
         if len(self._seg) >= 2:
             (t1, p1), (t2, p2) = self._seg[-2], self._seg[-1]
             return p2 + (p2 - p1) * (t - t2) / max(t2 - t1, 1e-6)
@@ -324,9 +348,9 @@ class BallTracker:
         flight = self._fit(pts) if len(pts) >= self.min_fit else None
         if flight is None:
             return  # no verified arc: not evidence of a hit or bounce (rolling, carried, noise)
-        mph = flight.horizontal_mph
-        if len(pts) >= self.speed_min_points and mph <= self.speed_max_mph:
-            self.last_mph = mph  # only well-observed flights drive the speed card
+        kmh = flight.horizontal_kmh
+        if len(pts) >= self.speed_min_points and kmh <= self.speed_max_kmh:
+            self.last_kmh = kmh  # only well-observed flights drive the speed card
         # Ending low and falling = bounce (ground point -> exact court position); otherwise a hit.
         z_end = flight.position(t_end)[2]
         vz_end = flight.v0[2] - G_FT * (t_end - flight.t0)
@@ -335,7 +359,7 @@ class BallTracker:
             xy = self.calib.image_to_court([uv_end])[0]
         else:
             xy = flight.position(t_end)[:2]
-        events.append(BallEvent("bounce" if is_bounce else "hit", t_end, uv_end, xy, mph))
+        events.append(BallEvent("bounce" if is_bounce else "hit", t_end, uv_end, xy, kmh))
 
     def _reach(self, dt: float) -> float:
         return min(self.reach_base_px + self.reach_px_per_s * max(dt, 0.0), self.reach_max_px)
@@ -348,52 +372,151 @@ class BallTracker:
             return self._predict(t), 3 * self.break_px
         return self._seg[-1][1], self._reach(t - self._seg[-1][0])
 
+    def _reset(self) -> None:
+        self._seg, self._pending, self._flight, self._trail = [], [], None, []
+
+    def _lost(self, t: float) -> bool:
+        """Main track gone: not seen for too long, or coasting on an arc for longer than the arc was
+        observed, or out of the picture."""
+        if not self._seg:
+            return False
+        gap = t - self._seg[-1][0]
+        if self._flight is None:
+            return gap > self.max_gap_s
+        span = self._seg[-1][0] - self._seg[0][0]
+        if gap > min(self.max_coast_s, max(self.min_coast_s, span)):
+            return True
+        if gap > 0 and self.camera is not None:
+            u, v = self._project(self._flight, t)
+            w, h = self.calib.image_size
+            return not (-50 <= u <= w + 50 and -50 <= v <= h + 50)
+        return False
+
     def update(self, t: float, candidates: list[BallCandidate]) -> BallState:
         events: list[BallEvent] = []
-        max_gap = self.max_coast_s if self._flight is not None else self.max_gap_s
-        if self._seg and t - self._seg[-1][0] > max_gap:
-            self._seg, self._pending, self._flight = [], [], None  # lost: ball dead or occluded too long
-            self._trail = []
+        if self._lost(t):
+            self._reset()  # ball dead, occluded too long, or its arc no longer trustworthy
 
-        pred = self._predict(t)
-        chosen, off_arc = None, False
-        if candidates and self._seg:
-            last_t, last_uv = (self._pending or self._seg)[-1]
-            d_pred = [np.linalg.norm(c.uv - pred) for c in candidates] if pred is not None else None
-            d_last = [np.linalg.norm(c.uv - last_uv) for c in candidates]
-            if d_pred is not None and min(d_pred) <= self.gate_px:
-                chosen = candidates[int(np.argmin(d_pred))].uv
-                off_arc = self._flight is not None and min(d_pred) > self.break_px
-            elif min(d_last) <= self._reach(t - last_t):
-                # Not where the arc said: after a hit the ball restarts from where it was.
-                chosen = candidates[int(np.argmin(d_last))].uv
-                off_arc = self._flight is not None
-        elif candidates:
-            ok = [c for c in candidates if self._acquirable(c.uv)]
-            if ok:
-                chosen = max(ok, key=lambda c: c.area).uv
+        rest = list(candidates)
+        chosen = None
+        if self._seg and rest:
+            pick = self._choose(t, rest)
+            if pick is not None:
+                cand, off_arc = pick
+                rest = [c for c in rest if c is not cand]
+                chosen = cand.uv
+                self._add_point(t, chosen, off_arc, events)
+                self._trail = (self._trail + [chosen])[-10:]
 
-        if chosen is not None:
-            if off_arc:
-                self._pending.append((t, chosen))
-                if len(self._pending) >= 2:
-                    # Two points in a row off the arc: the ball changed velocity between the last
-                    # good point and the first pending one.
-                    self._close_segment(self._seg[-1][0], self._seg[-1][1], events)
-                    self._seg, self._pending, self._flight = list(self._pending), [], None
+        rest = self._feed_hypotheses(t, rest)
+        if not self._seg:
+            h = self._best_hypothesis(t, need_arc=False)
+            if h is not None:
+                chosen = self._adopt(h)
             else:
-                self._pending = []  # a single off-arc point was an outlier
-                self._seg.append((t, chosen))
-                self._refit(events)
-            self._trail = (self._trail + [chosen])[-10:]
+                ok = [c for c in rest if self._acquirable(c.uv)]
+                if ok:
+                    cand = max(ok, key=lambda c: c.area)
+                    rest = [c for c in rest if c is not cand]
+                    chosen = cand.uv
+                    self._seg, self._trail = [(t, chosen)], [chosen]
+        elif self._flight is None or chosen is None:
+            # The main track has no arc, or lost the ball this frame: take a side track that has one.
+            h = self._best_hypothesis(t, need_arc=True)
+            if h is not None:
+                chosen = self._adopt(h)
+        for c in rest:
+            if len(self._hyps) < self.max_hypotheses and self._acquirable(c.uv):
+                self._hyps.append(_Hypothesis([(t, c.uv)]))
 
-        state = BallState(uv=chosen, trail=list(self._trail), last_mph=self.last_mph, events=events)
+        if self._seg and self._flight is None and len(self._seg) >= self.stale_points:
+            # Many points and still no ballistic arc: not the ball in play.
+            self._hyps.append(_Hypothesis(self._seg[-self.hyp_window:], junk=True))
+            self._reset()
+            chosen = None
+
+        state = BallState(uv=chosen, trail=list(self._trail), last_kmh=self.last_kmh, events=events)
         if self._flight is not None:
             state.xyz = self._flight.position(t)
-            state.flight_mph = self._flight.horizontal_mph
+            state.flight_kmh = self._flight.horizontal_kmh
             if chosen is None and self.camera is not None:
                 state.predicted_uv = self.camera.project(state.xyz)[0]
         return state
+
+    def _choose(self, t: float, candidates: list[BallCandidate]) -> tuple[BallCandidate, bool] | None:
+        """The main track's candidate this frame, and whether it is off the current arc."""
+        pred = self._predict(t)
+        last_t, last_uv = (self._pending or self._seg)[-1]
+        if pred is not None:
+            d_pred = [np.linalg.norm(c.uv - pred) for c in candidates]
+            k = int(np.argmin(d_pred))
+            if d_pred[k] <= self.gate_px:
+                return candidates[k], self._flight is not None and d_pred[k] > self.break_px
+        d_last = [np.linalg.norm(c.uv - last_uv) for c in candidates]
+        k = int(np.argmin(d_last))
+        if d_last[k] <= self._reach(t - last_t):
+            # Not where the arc said: after a hit the ball restarts from where it was.
+            return candidates[k], self._flight is not None
+        return None
+
+    def _add_point(self, t: float, uv: np.ndarray, off_arc: bool, events: list[BallEvent]) -> None:
+        if off_arc:
+            self._pending.append((t, uv))
+            if len(self._pending) >= 2:
+                # Two points in a row off the arc: the ball changed velocity between the last
+                # good point and the first pending one.
+                self._close_segment(self._seg[-1][0], self._seg[-1][1], events)
+                self._seg, self._pending, self._flight = list(self._pending), [], None
+        else:
+            self._pending = []  # a single off-arc point was an outlier
+            self._seg.append((t, uv))
+            self._refit(events)
+
+    def _feed_hypotheses(self, t: float, candidates: list[BallCandidate]) -> list[BallCandidate]:
+        """Extend the side tracks with candidates the main track didn't take; returns the unused ones."""
+        self._hyps = [h for h in self._hyps if t - h.pts[-1][0] <= self.max_gap_s]
+        free = list(candidates)
+        for h in sorted(self._hyps, key=lambda h: -len(h.pts)):
+            if not free:
+                break
+            last_t, last_uv = h.pts[-1]
+            k = None
+            if h.flight is not None and self.camera is not None:
+                pred = self._project(h.flight, t)
+                dists = [np.linalg.norm(c.uv - pred) for c in free]
+                if min(dists) <= self.gate_px:
+                    k = int(np.argmin(dists))
+            if k is None:
+                dists = [np.linalg.norm(c.uv - last_uv) for c in free]
+                if min(dists) > self._reach(t - last_t):
+                    continue
+                k = int(np.argmin(dists))
+            h.pts = (h.pts + [(t, free.pop(k).uv)])[-self.hyp_window:]
+            h.flight = self._fit(h.pts)
+            if h.flight is None and len(h.pts) > self.min_fit:
+                tail = h.pts[-self.min_fit:]
+                h.flight = self._fit(tail)
+                if h.flight is not None:
+                    h.pts = tail  # the ball changed velocity before the tail
+            if h.flight is not None:
+                h.junk = False
+        return free
+
+    def _best_hypothesis(self, t: float, need_arc: bool) -> _Hypothesis | None:
+        live = [h for h in self._hyps if h.pts[-1][0] == t and not h.junk
+                and (h.flight is not None or not need_arc)]
+        if not live:
+            return None
+        return max(live, key=lambda h: (h.flight is not None, len(h.pts)))
+
+    def _adopt(self, h: _Hypothesis) -> np.ndarray:
+        """Make a side track the main one. A main track without an arc goes back to the side tracks."""
+        self._hyps.remove(h)
+        if self._seg and self._flight is None:
+            self._hyps.append(_Hypothesis(self._seg[-self.hyp_window:], junk=len(self._seg) >= self.stale_points))
+        self._seg, self._pending, self._flight = list(h.pts), [], h.flight
+        self._trail = [p[1] for p in h.pts][-10:]
+        return h.pts[-1][1]
 
     def _refit(self, events: list[BallEvent]) -> None:
         fit = self._fit(self._seg)

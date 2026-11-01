@@ -71,14 +71,14 @@ def draw_ball(img: np.ndarray, uv, trail, predicted_uv=None) -> None:
                    cv2.LINE_AA)
 
 
-def draw_speed_card(img: np.ndarray, mph: float | None, x: int, y: int) -> None:
+def draw_speed_card(img: np.ndarray, kmh: float | None, x: int, y: int) -> None:
     w, h = 250, 92
     _panel(img, x, y, w, h)
     cv2.line(img, (x + 6, y + 10), (x + 6, y + 30), BALL, 3)
     _text(img, "BALL SPEED", (x + 16, y + 26), 0.55, TEXT, 1)
-    val = f"~{mph:.0f}" if mph is not None else "--"
+    val = f"~{kmh:.0f}" if kmh is not None else "--"
     _text(img, val, (x + 16, y + 64), 1.1, TEXT, 2)
-    _text(img, "MPH", (x + 190, y + 62), 0.55, BALL, 2)
+    _text(img, "KM/H", (x + 180, y + 62), 0.55, BALL, 2)
     _text(img, "AVG HORIZONTAL - EST.", (x + 16, y + 84), 0.36, MUTED)
 
 
@@ -91,41 +91,84 @@ def draw_rally_card(img: np.ndarray, rally: dict | None, x: int, y: int) -> None
     _text(img, "OBSERVED CONTACTS", (x + 16, y + 84), 0.36, MUTED)
 
 
-def draw_court_map(img: np.ndarray, players: dict[str, np.ndarray], x: int, y: int, px_per_ft: float = 4.0,
-                   ball_xy=None, bounces=()) -> None:
-    cw, ch = int(court.WIDTH_FT * px_per_ft), int(court.LENGTH_FT * px_per_ft)
-    pad, top = 14, 26
-    w, h = cw + 2 * pad, ch + top + pad + 16
+COURT_FILL = (92, 60, 40)  # BGR, muted court blue
+KITCHEN_FILL = (78, 92, 52)  # non-volley zones, muted teal
+APRON_FILL = (52, 44, 38)  # run-off around the court
+MAP_LINE = (225, 225, 225)
+MAP_MARGIN_FT = (3.0, 5.0)  # run-off shown beside the sidelines and behind the baselines
+
+
+def map_size(px_per_ft: float) -> tuple[int, int]:
+    mx, my = MAP_MARGIN_FT
+    return (int(round((court.WIDTH_FT + 2 * mx) * px_per_ft)) + 16,
+            int(round((court.LENGTH_FT + 2 * my) * px_per_ft)) + 26 + 18)
+
+
+def _fade(color, alpha: float, base=APRON_FILL):
+    return tuple(int(c * alpha + b * (1 - alpha)) for c, b in zip(color, base))
+
+
+def draw_court_map(img: np.ndarray, players: dict[str, np.ndarray], x: int, y: int, px_per_ft: float = 5.0,
+                   ball_xy=None, bounces=(), ball_z: float | None = None, ball_trail=(),
+                   player_trails: dict[str, list] | None = None) -> None:
+    """Top-down court, camera side at the bottom. Players are slot-coloured dots with a short
+    fading trail; the ball's ground track is a yellow dot (larger the higher it is) with its recent
+    path; bounces are fading rings. Points beyond the run-off are pinned to the edge."""
+    mx, my = MAP_MARGIN_FT
+    w, h = map_size(px_per_ft)
     _panel(img, x, y, w, h)
     _text(img, "COURT MAP", (x + 10, y + 17), 0.42, TEXT)
-    ox, oy = x + pad, y + top
+    ox, oy = x + 8, y + 26
 
     def p(cx, cy):  # far baseline at the top
-        return int(round(ox + cx * px_per_ft)), int(round(oy + (court.LENGTH_FT - cy) * px_per_ft))
+        cx = float(np.clip(cx, -mx, court.WIDTH_FT + mx))
+        cy = float(np.clip(cy, -my, court.LENGTH_FT + my))
+        return int(round(ox + (cx + mx) * px_per_ft)), int(round(oy + (court.LENGTH_FT + my - cy) * px_per_ft))
 
+    cv2.rectangle(img, p(-mx, court.LENGTH_FT + my), p(court.WIDTH_FT + mx, -my), APRON_FILL, -1)
+    cv2.rectangle(img, p(0, court.LENGTH_FT), p(court.WIDTH_FT, 0), COURT_FILL, -1)
+    cv2.rectangle(img, p(0, court.FAR_KITCHEN_Y), p(court.WIDTH_FT, court.NEAR_KITCHEN_Y), KITCHEN_FILL, -1)
     for a, b in court.LINES:
-        cv2.line(img, p(*a), p(*b), (170, 170, 170), 1, cv2.LINE_AA)
-    cv2.line(img, p(*court.NET[0]), p(*court.NET[1]), (210, 210, 210), 1, cv2.LINE_AA)
+        cv2.line(img, p(*a), p(*b), MAP_LINE, 1, cv2.LINE_AA)
+    (n0, n1), post = court.NET, 1.0
+    cv2.line(img, p(n0[0] - post, n0[1]), p(n1[0] + post, n1[1]), (245, 245, 245), 2, cv2.LINE_AA)
+    for px_ in (p(n0[0] - post, n0[1]), p(n1[0] + post, n1[1])):
+        cv2.circle(img, px_, 2, (245, 245, 245), -1, cv2.LINE_AA)
 
-    def clip(xy):
-        return float(np.clip(xy[0], -2, court.WIDTH_FT + 2)), float(np.clip(xy[1], -3, court.LENGTH_FT + 3))
+    for bxy, alpha in bounces:  # recent bounces: exact ground points
+        q = p(*bxy)
+        cv2.circle(img, q, 5, _fade(BALL, alpha, COURT_FILL), 1, cv2.LINE_AA)
+        cv2.circle(img, q, 1, _fade(BALL, alpha, COURT_FILL), -1, cv2.LINE_AA)
 
-    for bxy, alpha in bounces:  # recent bounces as fading crosses (exact ground points)
-        c = tuple(int(v * alpha + 60 * (1 - alpha)) for v in BALL)
-        q = p(*clip(bxy))
-        cv2.line(img, (q[0] - 3, q[1] - 3), (q[0] + 3, q[1] + 3), c, 1, cv2.LINE_AA)
-        cv2.line(img, (q[0] - 3, q[1] + 3), (q[0] + 3, q[1] - 3), c, 1, cv2.LINE_AA)
-    if ball_xy is not None:
-        cv2.circle(img, p(*clip(ball_xy)), 3, BALL, -1, cv2.LINE_AA)
+    for slot, trail in (player_trails or {}).items():
+        pts = [p(*xy) for xy in trail]
+        for k in range(1, len(pts)):
+            cv2.line(img, pts[k - 1], pts[k], _fade(SLOT_COLORS[slot], 0.15 + 0.6 * k / len(pts), COURT_FILL), 2,
+                     cv2.LINE_AA)
+
+    def on_map(xy):  # the ball is not pinned to the edge like players: off the map is just off the map
+        return -mx <= xy[0] <= court.WIDTH_FT + mx and -my <= xy[1] <= court.LENGTH_FT + my
+
+    for k in range(1, len(ball_trail)):
+        if on_map(ball_trail[k - 1]) and on_map(ball_trail[k]):
+            cv2.line(img, p(*ball_trail[k - 1]), p(*ball_trail[k]),
+                     _fade(BALL, 0.2 + 0.8 * k / len(ball_trail), COURT_FILL), 1, cv2.LINE_AA)
+    if ball_xy is not None and on_map(ball_xy):
+        r = 3 + int(round(3 * np.clip((ball_z or 0.0) / 10.0, 0.0, 1.0)))  # 3 px on the floor, 6 px at 10 ft up
+        q = p(*ball_xy)
+        cv2.circle(img, q, r + 1, (20, 20, 20), -1, cv2.LINE_AA)
+        cv2.circle(img, q, r, BALL, -1, cv2.LINE_AA)
+
     for slot, xy in players.items():
-        cx = float(np.clip(xy[0], -2, court.WIDTH_FT + 2))
-        cy = float(np.clip(xy[1], -3, court.LENGTH_FT + 3))
-        cv2.circle(img, p(cx, cy), 5, SLOT_COLORS[slot], -1, cv2.LINE_AA)
-        _text(img, slot[1], (p(cx, cy)[0] - 3, p(cx, cy)[1] + 4), 0.32, (20, 20, 20))
-    _text(img, "PLAYER POSITIONS", (x + 10, y + h - 6), 0.32, MUTED)
+        q = p(*xy)
+        cv2.circle(img, q, 8, (20, 20, 20), -1, cv2.LINE_AA)
+        cv2.circle(img, q, 7, SLOT_COLORS[slot], -1, cv2.LINE_AA)
+        _text(img, slot[1], (q[0] - 4, q[1] + 4), 0.36, (20, 20, 20), 1)
+    _text(img, "CAMERA SIDE", (x + w // 2 - 32, y + h - 6), 0.32, MUTED)
 
 
 def draw_distance_panel(img: np.ndarray, distances: dict[str, float], x: int, y: int) -> None:
+    """distances: slot -> metres."""
     w, h = 250, 34 + 26 * 4 + 10
     _panel(img, x, y, w, h)
     _text(img, "DISTANCE COVERED", (x + 12, y + 20), 0.5, TEXT, 1)
@@ -136,14 +179,16 @@ def draw_distance_panel(img: np.ndarray, distances: dict[str, float], x: int, y:
         _text(img, slot, (x + 30, yy), 0.5, TEXT)
         val = f"~{distances[slot]:.0f}" if slot in distances else "--"
         _text(img, val, (x + 150, yy), 0.62, SLOT_COLORS[slot] if slot in distances else MUTED, 2)
-        _text(img, "ft", (x + 215, yy), 0.42, MUTED)
+        _text(img, "m", (x + 215, yy), 0.42, MUTED)
 
 
 def render_frame(frame: np.ndarray, calib: Calibration, players: dict[str, dict], distances: dict[str, float],
                  camera_status: str = "steady", ball: dict | None = None,
                  rally: dict | None = None) -> np.ndarray:
-    """players: slot -> {"xy": court ft, "box": px box or None}.
-    ball: {"uv", "trail", "xy" (estimated ground track or None), "mph", "bounces": [(xy, alpha)]}."""
+    """players: slot -> {"xy": court ft, "box": px box or None, "trail": recent court ft positions}.
+    distances: slot -> metres covered.
+    ball: {"uv", "trail", "xy" (estimated ground track or None), "z" (height ft), "map_trail" (recent
+    ground track), "kmh", "bounces": [(xy, alpha)]}."""
     img = frame.copy()
     for slot, p in players.items():
         draw_floor_ring(img, calib, p["xy"], SLOT_COLORS[slot])
@@ -154,11 +199,16 @@ def render_frame(frame: np.ndarray, calib: Calibration, players: dict[str, dict]
     ball = ball or {}
     if ball:
         draw_ball(img, ball.get("uv"), ball.get("trail", []), ball.get("predicted_uv"))
-    draw_speed_card(img, ball.get("mph"), W - 16 - 250, 170)
+    draw_speed_card(img, ball.get("kmh"), W - 16 - 250, 170)
     draw_rally_card(img, rally, W - 16 - 250, 272)
     draw_distance_panel(img, distances, 16, H - 160)
-    draw_court_map(img, {s: p["xy"] for s, p in players.items()}, W - 16 - 108, H - 16 - 234,
-                   ball_xy=ball.get("xy"), bounces=ball.get("bounces", ()))
+    # Fill the space under the cards: 5 px/ft on 720p, scaled with the frame height.
+    px_per_ft = 5.0 * H / 720
+    mw, mh = map_size(px_per_ft)
+    draw_court_map(img, {s: p["xy"] for s, p in players.items()}, W - 16 - mw, H - 16 - mh, px_per_ft,
+                   ball_xy=ball.get("xy"), bounces=ball.get("bounces", ()), ball_z=ball.get("z"),
+                   ball_trail=ball.get("map_trail", ()),
+                   player_trails={s: p["trail"] for s, p in players.items() if p.get("trail")})
     footer = "ESTIMATED MOTION - pickleballOS"
     if camera_status == "rebased":
         footer = "CAMERA MOVED - CALIBRATION RE-ALIGNED - " + footer
